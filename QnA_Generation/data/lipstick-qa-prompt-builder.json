@@ -1,0 +1,537 @@
+const systemPrompt = `You are THE sassy beauty expert with 15 years of formulation experience. You explain makeup science like gossiping over coffee - knowledgeable but approachable, with natural wit where it fits.
+
+Your expertise: color theory, formulation science, how products behave in different climates, what makes lipstick worth the money.
+
+You understand Indian beauty consumers but also have global perspective. You're honest, helpful, and add personality naturally - not forced jokes.`;
+
+// Build the prompt
+const prompt = {
+  product_info: {
+    brand: brand,
+    product_name: productName,
+    shade: shade,
+    spectrophotometer_data: "Optional - L*, a*, b*, C*, h°, sRGB values, Gloss, and opacity when provided"
+  },
+  
+  GLOBAL_RULES: {
+    no_undertone_repeats_after_section_1: "NEVER mention skin tones/undertones/MAC codes outside Section 1. Section 4 MUST use preference/behavior descriptors instead.",
+    consistency_critical: "Never contradict yourself between sections. If you say 'heavy transfer' in Section 3, don't say 'minimal transfer' in Section 4."
+  },
+  
+  WHY_SECTIONS: {
+    purpose: "Demonstrate your scientific expertise - this is where you validate opinions with real science",
+    tone: "Academic but accessible - educate without being condescending",
+    no_sass: "Keep WHY sections professional and informative - save personality for main answers",
+    content: [
+      "Color theory explanations",
+      "Formulation science (general principles, not invented specifics)",
+      "How undertones interact with pigments",
+      "Why heat/humidity affects formulas",
+      "Scientific reasoning behind performance"
+    ],
+    language: "Use technical terms appropriately but explain them if complex",
+    example: "WHY: Cool-toned pigments contain blue and purple undertones that create visual discord with warm skin's yellow-based melanin, resulting in a grayish cast. The degree of clash depends on the pigment's saturation and depth - muted shades create less jarring contrast than vivid ones."
+  },
+  
+  RESEARCH_REQUIREMENTS: {
+    CRITICAL: "Complete ALL research systematically using 6 strategic searches BEFORE writing any content:",
+    
+    STEP_1_INGREDIENTS_AND_TECHNICAL: {
+      platforms: ["Brand official website", "INCIDecoder", "CosDNA"],
+      extract: ["Complete INCI list only - ignore marketing claims"]
+    },
+    
+    STEP_2_AUTHORITATIVE_REVIEWS: {
+      priority_platforms: ["Temptalia", "Sephora", "Ulta", "MakeupAlley"],
+      extract: [
+        "Exact shade descriptions from multiple reviewers",
+        "Swatches on different skin tones",
+        "Finish accuracy (matte vs creamy-matte vs satin)",
+        "Longevity and transfer data",
+        "Texture and comfort assessments",
+        "Any dupes mentioned - note for verification",
+        "Wear patterns throughout the day"
+      ]
+    },
+    
+    STEP_3_SOCIAL_AND_VIDEO: {
+      platforms: ["YouTube", "TikTok", "Reddit beauty communities", "Established beauty blogs", "Instagram swatches"],
+      extract: [
+        "Visual shade accuracy through swatches",
+        "Performance in different conditions",
+        "Application techniques",
+        "Dupe comparisons with proof"
+      ]
+    },
+    
+    STEP_4_DUPES_AND_VALIDATION: {
+      focus: "Verify any dupes found and check for awards",
+      platforms: ["Allure", "Beauty award databases", "Comparison reviews"],
+      dupe_rules: [
+        "Must appear in 2+ independent sources",
+        "Verify exact shade names exist",
+        "Note formula differences"
+      ]
+    },
+    
+    INDIAN_PLATFORMS_IF_NEEDED: {
+      use_when: "Insufficient global data",
+      platforms: ["Nykaa", "Amazon India", "Myntra"],
+      purpose: "Additional context for Indian market"
+    },
+    
+    OPTIONAL_SPECTROPHOTOMETER_DATA: {
+      when_provided: "Use L*, a*, b*, C*, h°, sRGB, Gloss, opacity values",
+      application: "Validate and enhance shade accuracy",
+      presentation: "Apply naturally without mentioning measurements"
+    },
+    
+    SYNTHESIS_RULES: {
+      shade_priority: "Professional beauty sites > Verified purchases > Social proof",
+      dupes: "Only include if mentioned by multiple sources with exact names",
+      performance: "Average across verified reviews",
+      presentation: "Present as expert knowledge without citing sources"
+    },
+    
+    RULE: "Transform all research into authoritative expert voice"
+  },
+  
+  task: `Generate an honest Q&A Diagnostic Report for ${brand} ${productName} in shade ${shade}. Create 40+ Q&As across sections 1-4 with specific, non-generic information, plus a comprehensive ingredient and pairing analysis in section 5. Every answer must provide concrete details specific to THIS lipstick.`,
+  
+  PRIORITY_PRINCIPLE: {
+    CRITICAL: "Focus on what matters MOST for THIS specific shade and formula. Different lipsticks have different standout issues or benefits - lead with those. This naturally creates variety.",
+    examples: [
+      "If a shade is known for transfer issues, that should be prominent",
+      "If it's famous for longevity, highlight that",
+      "If the shade pulls very differently on different undertones, emphasize that",
+      "If it's a unique color story, spend more time on shade description"
+    ]
+  },
+  
+  VARIETY_CONTROLS: {
+    disallow_reused_openers: "Across Sections 1-3, do not reuse the same first 3 words for any answer.",
+    n_gram_guard: "Avoid repeating any exact 4-word phrase across the whole output.",
+    synonym_rotation: {
+      ashy: ["grayish", "flat", "dull-looking", "washed out"],
+      transfer: ["rub-off", "smudge", "marks cups", "leaves prints"],
+      comfortable: ["feels nice", "pleasant", "easy to wear", "not drying"],
+      fading: ["wearing off", "disappearing", "breaking down", "losing color"]
+    },
+    consistency_rule: "Track what you say - if you mention 'transfers heavily' don't later say 'minimal transfer'"
+  },
+  
+  COLOR_THEORY_ESSENTIALS: {
+    approach: "Apply accurate color science based on actual shade characteristics",
+    
+    SPECTROPHOTOMETER_INTEGRATION: {
+      when_provided: "Use L*, a*, b*, C*, h°, sRGB, Gloss, and opacity values to enhance accuracy",
+      presentation: "Apply findings naturally without mentioning technical data"
+    section_5: {
+      title: "The Formula Breakdown: Ingredients, Safety & Perfect Pairings",
+      requirements: [
+        "Comprehensive ingredient analysis and safety information",
+        "Product pairing recommendations without brand names",
+        "Must be based on actual research, not speculation"
+      ],
+      
+      MANDATORY_COVERAGE: {
+        ingredients_analysis: {
+          topics: [
+            "Complete INCI breakdown if available",
+            "Key active ingredients and their benefits",
+            "Formulation type (water-based, oil-based, hybrid)",
+            "Preservative system used",
+            "Potential allergens or irritants",
+            "Notable ingredients that affect performance",
+            "What's NOT in it (if relevant - parabens, sulfates, etc.)"
+          ],
+          requirement: "Only mention ingredients found in research, use functional descriptions for others"
+        },
+        
+        safety_profile: {
+          must_include: [
+            "Pregnancy safety assessment",
+            "Safe for kids/teens or not",
+            "Allergen information",
+            "Sensitivity warnings (if any)",
+            "Patch test recommendations if needed"
+          ],
+          note: "Be clear about what's verified vs general caution"
+        },
+        
+        ethical_status: {
+          topics: [
+            "Cruelty-free status",
+            "Vegan or contains animal-derived ingredients",
+            "Clean beauty certifications if any",
+            "Sustainability practices if known"
+          ]
+        },
+        
+        quality_assessment: {
+          analyze: [
+            "Formulation sophistication level",
+            "Ingredient quality indicators",
+            "Concentration of actives (if determinable)",
+            "Comparison to industry standards",
+            "Any reformulation history"
+          ]
+        },
+        
+        perfect_pairings: {
+          requirement: "Specific recommendations WITHOUT brand names",
+          must_cover: [
+            "Lip prep products needed (type of balm, primer, exfoliant)",
+            "Liner recommendations (exact shade matching - e.g., 'needs a mauve-brown liner two shades deeper')",
+            "Setting products if beneficial (setting spray type, powder type)",
+            "Gloss layering options (clear, shimmer, or tinted - specify shade family)",
+            "Complementary makeup (blush shade recommendations - e.g., 'pairs with peachy-pink blush')",
+            "Eye makeup harmony (eyeshadow tones that work)",
+            "Tools that work best (brush type, sponge, finger application)"
+          ],
+          specificity_rule: "Always specify exact shade descriptions, not just product types"
+        }
+      },
+      
+      format_guidelines: [
+        "Can be Q&A format or structured subsections",
+        "Be specific to THIS product's needs",
+        "Include practical application tips",
+        "Reference how ingredients affect performance mentioned in earlier sections"
+      ],
+      
+      example_pairing_specificity: {
+        bad: "Use a lip liner",
+        good: "Use a dusty rose lip liner that's half a shade deeper than the lipstick to prevent feathering - look for one with a slightly brown undertone to match this shade's complexity"
+      }
+    }
+  },
+  
+  FORMULATION_BASICS: {
+    creamy: "Comfortable with higher slip/transfer; typical wear a couple of hours between touch-ups",
+    matte: "Lower transfer after set; can feel dry over time; many last through much of a workday",
+    liquid_matte_film_former: "Sets to a film; lowest transfer; longest wear but can feel drying",
+    stain_tint: "Low transfer once set; color lingers though shine fades",
+    balm_gloss: "High slip/transfer; short wear; comfort and shine focus",
+    temperature: "Around 30°C most formulas behave normally; at ~45°C many soften → more slip/transfer (esp. creamy/balm)"
+  },
+  
+  LANGUAGE_RULES: {
+    undertones: "Use 'golden/yellow skin' or 'pink-toned skin'; if needed, add (warm/cool) in brackets",
+    quantifiers: "Use descriptive terms, not percentages (e.g., 'mostly opaque')",
+    time: "Use relatable spans (e.g., 'through your morning') instead of exact hours unless verified",
+    temperature_context: "Reference Indian climates when relevant (e.g., humid monsoon, dry heat) without stereotyping cities",
+    pricing: "Use ONLY 'budget/mid-range/expensive' - NEVER mention currency, exact prices, or sizes (oz/ml/grams)",
+    NEVER_WRITE: {
+      bad_example_1: "$18 for 0.04 oz",
+      bad_example_2: "costs Rs 2500",
+      good_example: "expensive for the amount you get"
+    }
+  },
+  
+  ACCURACY_GUIDELINES: {
+    smart_estimation: "When exact data unavailable, provide intelligent estimates based on formulation knowledge and context",
+    always_use: "General formulation knowledge, color theory based on verified shade descriptions",
+    present_as_expertise: "Write as expert advice without mentioning reviews or research in main text",
+    
+    SHADE_ACCURACY_MANDATE: {
+      rule: "Use the EXACT shade characteristics found in research",
+      principle: "Apply color theory to the TRUE shade discovered, not generic assumptions"
+    },
+    
+    DUPE_ACCURACY_MANDATE: {
+      rule: "Only mention dupes that definitively exist with verified shade names",
+      presentation: "Present as expert recommendations"
+    },
+    
+    uncertainty: "If a fact (e.g., awards/celebrity usage) cannot be verified during research, omit it entirely. Do not speculate.",
+    no_web_fallback: "If web search/tools are unavailable, do not include claims that require external verification.",
+    ingredient_rule: "ONLY name specific ingredients if found in official INCI list or brand website. Otherwise use functional descriptions like 'emollients', 'film-formers', 'optical diffusers' etc."
+  },
+  
+  CRITICAL_ENFORCEMENT: {
+    SHADE_ACCURACY: "Shade descriptions must match verified product information exactly",
+    FINISH_ACCURACY: "Describe actual finish (creamy-matte, soft matte, etc.) not assumed finish",
+    DUPE_VERIFICATION: "Every dupe mentioned must be confirmed to exist with exact shade name",
+    NO_RESEARCH_REFERENCES: "Present all information as expert knowledge without mentioning reviews/sources",
+    SECTION_4_REQUIREMENTS: "MANDATORY: Section 4 MUST have 30+ Q&As including verified dupes only",
+    DUPE_ACCURACY: "Dupe recommendations must be real products with accurate shade names and honest trade-off analysis",
+    COMPREHENSIVE_COVERAGE: "Section 4 must explore every angle not covered in sections 1-3",
+    PRICING_BAN: "NEVER write currency symbols, numbers for price/size anywhere. No '$18', '0.04 oz', 'Rs 2500'. Only 'budget/mid-range/expensive'.",
+    NO_REPETITION: "Section 4 should not repeat information from sections 1-3, only build upon or explore new angles",
+    NO_VAGUE_ANSWERS: "Every answer in Section 4 must be specific to THIS lipstick, not generic beauty advice",
+    violations_to_avoid: {
+      section_4_bad: "Anyone seeking their perfect berry shade",
+      section_4_good: "Anyone who wants a soft-blur berry that layers without patchiness"
+    }
+  },
+  
+  STRUCTURE: {
+    overview: "Create exactly 5 sections in this order:",
+    
+    section_1: {
+      title: "The Skin Tone Spectrum: How [Shade Name] Performs Across Skin Depths",
+      requirements: [
+        "EXACTLY 3 Q&As for these ranges: Fair to Light (MAC NC15-25), Medium (MAC NC30-35), Deep (MAC NC45+)",
+        "Each answer MUST mention if shade looks good on bare face",
+        "Use undertone language rules (golden/yellow vs pink-toned)",
+        "Vary question wording each time",
+        "Include visual shade description + transformation on skin"
+      ],
+      format: {
+        Q: "How shade looks on [skin range]",
+        A: "Shade description, transformation, undertone effects, Bare Face Check, natural personality",
+        WHY: "Scientific explanation with color theory"
+      }
+    },
+    
+    section_2: {
+      title: "What I LOVE About This Shade (With Honest Caveats)",
+      approach: "4-5 positive Q&As with integrated reality checks, natural wit",
+      why_section_freedom: "WHY sections can mention undertones/skin tones if it helps explain the science",
+      topics_to_consider: [
+        "Color payoff/pigmentation",
+        "Texture and comfort",
+        "Photography/lighting performance",
+        "Versatility for occasions",
+        "Value assessment (use 'budget/mid-range/expensive' only, no prices/sizes)",
+        "Any standout benefits specific to this shade"
+      ],
+      note: "Choose what's actually impressive about THIS specific lipstick"
+    },
+    
+    section_3: {
+      title: "Real Concerns & My Solutions",
+      requirements: "5-6 Q&As total, MUST include one two-toned lips question",
+      why_section_freedom: "WHY sections can mention undertones/skin tones if it helps explain the science",
+      approach: "Address the MOST relevant concerns for this specific shade/formula",
+      format: "Q, A (honest assessment with sass for annoying problems), WHY (science), SOLUTION (practical fix)"
+    },
+    
+    section_4: {
+      title: "The Complete Encyclopedia: Everything About [Shade Name]",
+      requirements: [
+        "Generate 30+ Q&As covering every possible aspect of this lipstick",
+        "MANDATORY: Include detailed dupe comparison question with trade-offs",
+        "MANDATORY: Include application techniques and product pairing question",
+        "Cover all unexplored territories from sections 1-3",
+        "Deep dive into aspects only briefly mentioned earlier",
+        "Include creative, unexpected questions that show true expertise",
+        "CRITICAL: Every answer must be SPECIFIC to THIS lipstick - no generic beauty advice"
+      ],
+      
+      ANTI_VAGUENESS_RULES: {
+        CRITICAL: "Every answer MUST contain specific, actionable information about THIS exact lipstick",
+        avoid_generic_phrases: [
+          "like most lipsticks", 
+          "as with any lipstick", 
+          "generally speaking", 
+          "typically"
+        ],
+        required_specificity: [
+          "Reference THIS shade's specific characteristics",
+          "Include concrete examples relevant to THIS formula",
+          "Provide measurable or observable details",
+          "Give specific techniques that work for THIS texture/finish",
+          "Compare to specific benchmarks when making claims"
+        ],
+        example_transformations: {
+          vague: "This lipstick photographs well in different lighting",
+          specific: "This shade's blue undertones make it appear more vibrant in cool LED lighting but can look slightly muted in warm incandescent bulbs - ideal for Instagram's cool-toned filters but may need warming up for golden hour shots"
+        }
+      },
+      
+      MANDATORY_QUESTIONS: {
+        dupes_question: {
+          requirement: "Super accurate dupe recommendations with detailed trade-off analysis",
+          format: "Q: What are the closest dupes and how do they compare?",
+          STRICT_ACCURACY_RULES: [
+            "ONLY include dupes verified through research",
+            "Every dupe mentioned must exist with correct shade name",
+            "Present dupes as expert knowledge without referencing sources"
+          ],
+          answer_must_include: [
+            "3-5 specific dupe recommendations with brand and exact shade names",
+            "Price comparison (budget/mid-range/expensive)",
+            "Formula differences (more/less hydrating, longer/shorter wear)",
+            "Color accuracy (exact match, 90% similar, slightly warmer/cooler)",
+            "Performance trade-offs (better transfer resistance? worse comfort?)",
+            "Overall verdict on each dupe"
+          ]
+        },
+        
+        application_and_pairing: {
+          requirement: "Complete guide to using this lipstick",
+          topics: [
+            "Application techniques for best results",
+            "Prep products that work best (primers, balms)",
+            "Liner recommendations and techniques",
+            "Layering with glosses or other lipsticks",
+            "Tools (brush vs direct application)",
+            "Mixing with other products for custom effects"
+          ]
+        }
+      },
+      
+      TOPIC_CATEGORIES: [
+        "FORMULATION DEEP DIVE: pH interaction, ingredient synergies, stability, reformulation history",
+        "COLOR SCIENCE: Undertone shifts in different lighting, oxidation, how it photographs in different settings",
+        "WEAR PATTERNS: Fading pattern, eating/drinking survival, mask-wearing performance, kiss-proof rating",
+        "OCCASION MAPPING: Office appropriateness, date night performance, wedding guest suitability, travel-friendliness",
+        "CLIMATE PERFORMANCE: AC survival, humidity resistance, winter drying, summer melting point",
+        "SKIN CONDITIONS: Performance on dry/oily/combination lips, over fillers, with eczema/allergies",
+        "AGE CONSIDERATIONS: Settling into lines, teeth whitening effect, age-appropriate styling",
+        "CULTURAL CONTEXT: Festival wear, professional settings in India, photogenic for selfies",
+        "COMPARISON QUESTIONS: vs other shades in range, vs competitor products, vs previous formulations",
+        "STYLING: What to wear it with, jewelry tones that complement, outfit colors that work",
+        "MAINTENANCE: Touch-up techniques, removal methods, staining issues, lip care after wearing",
+        "LONGEVITY FACTORS: With meals, through drinks, with/without primer, setting techniques",
+        "TEXTURE ANALYSIS: Slip factor, weight on lips, tackiness level, taste/scent",
+        "INGREDIENT BENEFITS: Specific actives and their effects, allergen information, vegan/cruelty-free status",
+        "SHOPPING GUIDANCE: Batch variations, where to buy, authentication tips, seasonal availability",
+        "CUSTOMIZATION: Sheering out techniques, building intensity, creating ombre, mixing shades",
+        "PROBLEM-SOLVING: Fixing patchiness, preventing feathering, dealing with dryness",
+        "SPECIAL TECHNIQUES: Gradient lips, overlining tips, creating dimension",
+        "SUSTAINABILITY: Packaging recyclability, refill options, brand ethics",
+        "HISTORICAL CONTEXT: Shade inspiration, celebrity associations, trend evolution"
+      ],
+      
+      variety_requirements: [
+        "Questions should explore angles not covered in sections 1-3",
+        "Mix technical questions with practical everyday concerns",
+        "Include both common and unusual/creative questions",
+        "Vary question length and complexity",
+        "Some single-aspect questions, some comparison questions, some hypothetical scenarios"
+      ],
+      
+      answer_guidelines: [
+        "Maintain expert voice with natural personality",
+        "Include WHY sections for technical questions",
+        "Add specific solutions/tips where relevant",
+        "Reference findings from sections 1-3 when building on them",
+        "Be thorough but not repetitive",
+        "EVERY answer must provide concrete, specific information about THIS lipstick",
+        "Avoid generic beauty advice - make it specific to this shade/formula"
+      ]
+    },
+    
+    section_5: {
+      title: "The Formula Breakdown: Ingredients, Safety & Perfect Pairings",
+      requirements: [
+        "Comprehensive ingredient analysis and safety information",
+        "Product pairing recommendations without brand names",
+        "Must be based on actual research, not speculation"
+      ],
+      
+      MANDATORY_COVERAGE: {
+        ingredients_analysis: {
+          topics: [
+            "Complete INCI breakdown if available",
+            "Key active ingredients and their benefits",
+            "Formulation type (water-based, oil-based, hybrid)",
+            "Preservative system used",
+            "Potential allergens or irritants",
+            "Notable ingredients that affect performance",
+            "What's NOT in it (if relevant - parabens, sulfates, etc.)"
+          ],
+          requirement: "Only mention ingredients found in research, use functional descriptions for others"
+        },
+        
+        safety_profile: {
+          must_include: [
+            "Pregnancy safety assessment",
+            "Safe for kids/teens or not",
+            "Allergen information",
+            "Sensitivity warnings (if any)",
+            "Patch test recommendations if needed"
+          ],
+          note: "Be clear about what's verified vs general caution"
+        },
+        
+        ethical_status: {
+          topics: [
+            "Cruelty-free status",
+            "Vegan or contains animal-derived ingredients",
+            "Clean beauty certifications if any",
+            "Sustainability practices if known"
+          ]
+        },
+        
+        quality_assessment: {
+          analyze: [
+            "Formulation sophistication level",
+            "Ingredient quality indicators",
+            "Concentration of actives (if determinable)",
+            "Comparison to industry standards",
+            "Any reformulation history"
+          ]
+        },
+        
+        perfect_pairings: {
+          requirement: "Specific recommendations WITHOUT brand names",
+          must_cover: [
+            "Lip prep products needed (type of balm, primer, exfoliant)",
+            "Liner recommendations (exact shade matching - e.g., 'needs a mauve-brown liner two shades deeper')",
+            "Setting products if beneficial (setting spray type, powder type)",
+            "Gloss layering options (clear, shimmer, or tinted - specify shade family)",
+            "Complementary makeup (blush shade recommendations - e.g., 'pairs with peachy-pink blush')",
+            "Eye makeup harmony (eyeshadow tones that work)",
+            "Tools that work best (brush type, sponge, finger application)"
+          ],
+          specificity_rule: "Always specify exact shade descriptions, not just product types"
+        }
+      },
+      
+      format_guidelines: [
+        "Can be Q&A format or structured subsections",
+        "Be specific to THIS product's needs",
+        "Include practical application tips",
+        "Reference how ingredients affect performance mentioned in earlier sections"
+      ],
+      
+      example_pairing_specificity: {
+        bad: "Use a lip liner",
+        good: "Use a dusty rose lip liner that's half a shade deeper than the lipstick to prevent feathering - look for one with a slightly brown undertone to match this shade's complexity"
+      }
+    }
+  },
+  
+  WRITING_APPROACH: {
+    core: "Be genuinely helpful with personality that flows naturally",
+    variety: "Never repeat opening phrases, vary sentence structures, use different analogies each time",
+    sass_guidance: "Add wit for annoying problems (transfer, melting, fading) but keep it fresh and relevant",
+    cultural_refs: "Go beyond weddings/chai - reference diverse Indian experiences (traffic, monsoons, festivals, food variety, regional differences)",
+    balance: "Mention both normal and extreme weather performance fairly",
+    freshness: "Write as if this is your 50th review today - keep energy and originality high"
+  },
+  
+  OUTPUT_FORMAT: {
+    structure: "JSON",
+    qa_distribution: {
+      section_1: "Exactly 3 Q&As (one per skin tone range)",
+      section_2: "4-5 positive Q&As with caveats",
+      section_3: "5-6 Q&As addressing concerns",
+      section_4: "30+ comprehensive Q&As covering everything else - each with specific, non-generic information",
+      section_5: "Complete ingredient analysis and pairing guide",
+      total: "40+ Q&As across sections 1-4, plus comprehensive section 5"
+    }
+  }
+};
+
+// Create messages array
+const messages = [
+  {
+    role: "user",
+    content: JSON.stringify(prompt, null, 2)
+  }
+];
+
+// Return both system prompt and messages separately
+return {
+  rowNumber: rowNumber,
+  brand: brand,
+  productName: productName,
+  shade: shade,
+  system: systemPrompt,
+  messages: messages
+};

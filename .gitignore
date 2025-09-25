@@ -1,0 +1,35 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+
+# Virtual environments
+venv/
+.env
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor settings (optional)
+# .vscode/
+# .idea/
+
+# Logs
+*.log
+
+# Outputs and debug artifacts
+QnA_Generation/output/
+attribute_generation_upsert/output/
+**/debug/
+
+# Checkpoints and sidecars inside outputs (already covered by output/ but keep explicit)
+**/*.raw.json
+**/*.raw.full.txt
+**/*.audit.json
+**/checkpoint.json
+
+# Node/npm (if any)
+node_modules/

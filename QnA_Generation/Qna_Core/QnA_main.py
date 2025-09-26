@@ -519,6 +519,9 @@ def call_claude_with_web_search(api_key: str, model: str, user_content: str, max
         "x-api-key": api_key,
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
+        # Enable prompt caching (beta). This allows cache_control on the system block to be used and
+        # returns cache-related headers we can log.
+        "anthropic-beta": "prompt-caching-2024-07-31",
     }
     # Headers prepared
     payload: Dict[str, Any] = {
@@ -579,6 +582,10 @@ def call_claude_with_web_search(api_key: str, model: str, user_content: str, max
         resp.raise_for_status()
         data = resp.json()
 
+        # Read cache-related response headers for visibility
+        cache_status = resp.headers.get("anthropic-cache-status")
+        cache_token_credits = resp.headers.get("anthropic-cache-token-credits")
+
         # Optional debug: dump raw response JSON
         if debug_basepath:
             try:
@@ -589,6 +596,13 @@ def call_claude_with_web_search(api_key: str, model: str, user_content: str, max
         
         # Extract usage information
         usage_info = data.get("usage", {})
+        # Surface cache headers into usage_info for downstream logging
+        try:
+            if isinstance(usage_info, dict):
+                usage_info["anthropic-cache-status"] = cache_status
+                usage_info["anthropic-cache-token-credits"] = cache_token_credits
+        except Exception:
+            pass
         request_time = time.time() - start_time
         
         # The response content is a list of blocks; accumulate only text parts
@@ -610,7 +624,14 @@ def call_claude_with_web_search(api_key: str, model: str, user_content: str, max
                 text = text[5:]
             text = text.strip()
 
-        logger.info(f"LLM Response <- time={request_time:.2f}s usage={usage_info}")
+        # Include cache header summary in the log line for quick inspection
+        if cache_status or cache_token_credits:
+            logger.info(
+                "LLM Response <- time=%.2fs usage=%s cache_status=%s cache_token_credits=%s",
+                request_time, usage_info, cache_status, cache_token_credits,
+            )
+        else:
+            logger.info(f"LLM Response <- time={request_time:.2f}s usage={usage_info}")
 
         # Optional debug: dump assembled text
         if debug_basepath:

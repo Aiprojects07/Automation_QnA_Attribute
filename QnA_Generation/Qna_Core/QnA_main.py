@@ -163,7 +163,15 @@ def normalize_row(raw: Dict[str, str]) -> Dict[str, str]:
         or m.get("product_line")
     )
     shade = m.get("shade_of_lipstick") or m.get("shade") or m.get("color")
-    sku = m.get("sku") or m.get("sku_code") or m.get("product_sku") or m.get("item_code") or ""
+    # Support multiple SKU header variants including new 'Kult SKU Code'
+    sku = (
+        m.get("sku")
+        or m.get("sku_code")
+        or m.get("product_sku")
+        or m.get("item_code")
+        or m.get("kult_sku_code")
+        or ""
+    )
     # Optional category support
     category = m.get("category") or m.get("product_category") or m.get("category_name") or ""
     # Optional sub-category (handle hyphenated and concatenated variants)
@@ -178,6 +186,7 @@ def normalize_row(raw: Dict[str, str]) -> Dict[str, str]:
         m.get("leaf_level_category")
         or m.get("leaflevelcategory")
         or m.get("leaf_level_cat")
+        or m.get("sub_sub_category")  # new column name maps to leaf-level category
         or ""
     )
     # Optional color/appearance metrics (support multiple header variants)

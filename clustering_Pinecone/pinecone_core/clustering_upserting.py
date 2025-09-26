@@ -182,6 +182,7 @@ def build_records_from_report(data: Dict[str, Any], source_name: str) -> Tuple[L
 
     base_meta = {
         "product_id": product_id,
+        "sku": sku,
         "product_name": product_name,
         "brand": brand,
         "product_line": product_line,
@@ -227,10 +228,6 @@ def build_records_from_report(data: Dict[str, Any], source_name: str) -> Tuple[L
             ]
             parts.append("\n".join([p for p in qa_block if p]))
 
-    # Optionally append raw JSON at the end as catch-all for recall
-    raw_txt = json.dumps(data, ensure_ascii=False, indent=2)
-    parts.append("\n## RAW_JSON\n" + raw_txt)
-
     cluster_text = "\n\n".join([p for p in parts if p])
 
     # Use the raw SKU as the record ID for the single-cluster record
@@ -242,7 +239,6 @@ def build_records_from_report(data: Dict[str, Any], source_name: str) -> Tuple[L
             **base_meta,
             "doc_type": "product_cluster",
             "content": cluster_text,
-            "source": source_name,
         }
     }
 
@@ -330,19 +326,34 @@ def main():
             text_chunks = split_large_text(original_text)
             
             if len(text_chunks) == 1:
-                # No splitting needed
-                final_records.append(record)
+                # No splitting needed, but normalize and enrich metadata for consistency
+                cleaned_text = re.sub(r"\s+", " ", original_text).strip()
+                single_rec = record.copy()
+                single_rec["metadata"] = record["metadata"].copy()
+                single_rec["metadata"]["content"] = cleaned_text
+                single_rec["metadata"]["chunk_index"] = 0
+                single_rec["metadata"]["total_chunks"] = 1
+                single_rec["metadata"]["content_len"] = len(cleaned_text)
+                final_records.append(single_rec)
             else:
                 # Create separate records for each chunk
                 for chunk_idx, chunk_text in enumerate(text_chunks):
                     chunk_record = record.copy()
                     chunk_record["metadata"] = record["metadata"].copy()
-                    chunk_record["metadata"]["content"] = chunk_text
+                    # Normalize whitespace to store clean content (no embedded newlines/tabs)
+                    cleaned_text = re.sub(r"\s+", " ", chunk_text).strip()
+                    chunk_record["metadata"]["content"] = cleaned_text
                     chunk_record["metadata"]["chunk_index"] = chunk_idx
                     chunk_record["metadata"]["total_chunks"] = len(text_chunks)
-                    # Update ID to include chunk info
+                    # Ensure raw SKU is present for filtering
                     original_id = record["id"]
-                    chunk_record["id"] = f"{original_id}"
+                    chunk_record["metadata"]["sku"] = original_id
+                    # Add content length for integrity checks
+                    chunk_record["metadata"]["content_len"] = len(cleaned_text)
+                    # Update ID to include chunk info
+                    # Ensure each chunk has a unique vector ID to avoid upsert overwrites in Pinecone
+                    # Example: "<SKU>::chunk-1-of-3"
+                    chunk_record["id"] = f"{original_id}::chunk-{chunk_idx+1}-of-{len(text_chunks)}"
                     final_records.append(chunk_record)
         
         # Generate embeddings for all final texts
@@ -361,6 +372,8 @@ def main():
             
         # Update records to final_records
         records = final_records
+        
+        # Note: keeping full chunk text in metadata (content) so Pinecone can return exact context directly.
         
     except Exception as e:
         logger.error(f"Failed to generate embeddings: {e}")

@@ -178,10 +178,9 @@ def build_records_from_report(data: Dict[str, Any], source_name: str) -> Tuple[L
     sku = product.get("sku") or ""
     if not sku:
         raise ValueError("product.sku is required in the report JSON to build product identity (must be unique per product).")
-    product_id = slugify(sku)
+    product_id = sku
 
     base_meta = {
-        "product_id": product_id,
         "sku": sku,
         "product_name": product_name,
         "brand": brand,
@@ -193,28 +192,16 @@ def build_records_from_report(data: Dict[str, Any], source_name: str) -> Tuple[L
         "language": "en",
     }
 
-    # Build a SINGLE aggregated record (cluster) per product
-    # Compose a comprehensive text that includes meta + all sections + all QAs
-    parts: List[str] = []
-    meta_txt = "\n".join([
-        f"Product: {product_name}",
-        f"Brand: {brand}" if brand else "",
-        f"Line: {product_line}" if product_line else "",
-        f"Shade: {shade}" if shade else "",
-        f"Category: {category}" if category else "",
-        f"Sub-Category: {sub_category}" if sub_category else "",
-        f"Leaf Level Category: {leaf_level_category}" if leaf_level_category else "",
-    ]).strip()
-    if meta_txt:
-        parts.append(meta_txt)
-
+    # Build one record per section (title + optional content + QAs)
+    records: List[Dict[str, Any]] = []
     sections = data.get("sections") or []
     for s_idx, sec in enumerate(sections):
+        section_parts: List[str] = []
         title = ensure_str(sec.get("title")).strip()
         if title:
-            parts.append(f"\n# {title}")
+            section_parts.append(f"# {title}")
         if sec.get("content"):
-            parts.append(ensure_str(sec["content"]).strip())
+            section_parts.append(ensure_str(sec["content"]).strip())
         for q_idx, qa in enumerate(sec.get("qas") or []):
             q = ensure_str(qa.get("q")).strip()
             a = ensure_str(qa.get("a")).strip()
@@ -226,23 +213,25 @@ def build_records_from_report(data: Dict[str, Any], source_name: str) -> Tuple[L
                 f"WHY: {why}" if why else "",
                 f"SOLUTION: {sol}" if sol else "",
             ]
-            parts.append("\n".join([p for p in qa_block if p]))
+            section_parts.append("\n".join([p for p in qa_block if p]))
 
-    cluster_text = "\n\n".join([p for p in parts if p])
+        section_text = "\n\n".join([p for p in section_parts if p])
 
-    # Use the raw SKU as the record ID for the single-cluster record
-    r_id = sku
-    record = {
-        "id": r_id,
-        "values": None,
-        "metadata": {
-            **base_meta,
-            "doc_type": "product_cluster",
-            "content": cluster_text,
+        # Unique id per section under the SKU
+        r_id = f"{sku}::sec-{s_idx+1}"
+        record = {
+            "id": r_id,
+            "values": None,
+            "metadata": {
+                **base_meta,
+                "section_index": s_idx,
+                "section_title": title,
+                "content": section_text,
+            }
         }
-    }
+        records.append(record)
 
-    return [record], base_meta
+    return records, base_meta
 
 
 # -------------------- main --------------------
@@ -262,11 +251,11 @@ def main():
     )
     logger = logging.getLogger(__name__)
     
-    logger.info("Starting NARS report ingestion process")
+    logger.info("Starting report ingestion process")
     
     # Configuration from environment variables only
-    file_path = os.getenv("FILE_PATH", "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/output/3macqakpho2p887v0uufp1-mac-powder-kiss-velvet-blur-slim-stick-sweet-cinnamon.json")
-    index_name = os.getenv("PINECONE_INDEX_NAME", "lipstick-cluster")
+    file_path = os.getenv("FILE_PATH", "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/output/0sosyijthmprqf097stu7-milani-ludicrous-matte-lip-crayon-120-cant-even.json")
+    index_name = os.getenv("PINECONE_INDEX_NAME", "qna-attributes")
     namespace = os.getenv("PINECONE_NAMESPACE", "default")
     environment = os.getenv("PINECONE_ENVIRONMENT", "us-east-1")
     embedding_model = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large")
@@ -300,12 +289,12 @@ def main():
     try:
         logger.info("Building records from report JSON")
         records, base_meta = build_records_from_report(data, source_name=os.path.basename(file_path))
-        logger.info(f"Built {len(records)} records for product_id='{base_meta['product_id']}' product_name='{base_meta['product_name']}'")
+        logger.info(f"Built {len(records)} records for sku='{base_meta['sku']}' product_name='{base_meta['product_name']}'")
         # Identity check print (visual confirmation before upsert)
-        logger.info("IDENTITY | product_name='%s' product_id='%s' brand='%s' line='%s' shade='%s'",
-                    base_meta.get("product_name"), base_meta.get("product_id"),
+        logger.info("IDENTITY | product_name='%s' sku='%s' brand='%s' line='%s' shade='%s'",
+                    base_meta.get("product_name"), base_meta.get("sku"),
                     base_meta.get("brand"), base_meta.get("product_line"), base_meta.get("shade"))
-        print(f"[info] Built {len(records)} records for product_id='{base_meta['product_id']}' product_name='{base_meta['product_name']}'.")
+        print(f"[info] Built {len(records)} records for sku='{base_meta['sku']}' product_name='{base_meta['product_name']}'.")
     except Exception as e:
         logger.error(f"Failed to build records: {e}")
         raise
@@ -317,44 +306,40 @@ def main():
         texts = [r["metadata"]["content"] for r in records]
         logger.info(f"Generating embeddings for {len(texts)} text chunks with batch size {batch_size}")
         
-        # Handle text splitting - create new records for split chunks
+        # Since we already build per-section records, skip additional text splitting.
+        # Normalize content and annotate basic chunk metadata (single chunk per section).
         final_records = []
-        text_idx = 0
-        
         for record in records:
             original_text = record["metadata"]["content"]
-            text_chunks = split_large_text(original_text)
-            
-            if len(text_chunks) == 1:
-                # No splitting needed, but normalize and enrich metadata for consistency
-                cleaned_text = re.sub(r"\s+", " ", original_text).strip()
-                single_rec = record.copy()
-                single_rec["metadata"] = record["metadata"].copy()
-                single_rec["metadata"]["content"] = cleaned_text
-                single_rec["metadata"]["chunk_index"] = 0
-                single_rec["metadata"]["total_chunks"] = 1
-                single_rec["metadata"]["content_len"] = len(cleaned_text)
-                final_records.append(single_rec)
-            else:
-                # Create separate records for each chunk
-                for chunk_idx, chunk_text in enumerate(text_chunks):
-                    chunk_record = record.copy()
-                    chunk_record["metadata"] = record["metadata"].copy()
-                    # Normalize whitespace to store clean content (no embedded newlines/tabs)
-                    cleaned_text = re.sub(r"\s+", " ", chunk_text).strip()
-                    chunk_record["metadata"]["content"] = cleaned_text
-                    chunk_record["metadata"]["chunk_index"] = chunk_idx
-                    chunk_record["metadata"]["total_chunks"] = len(text_chunks)
-                    # Ensure raw SKU is present for filtering
-                    original_id = record["id"]
-                    chunk_record["metadata"]["sku"] = original_id
-                    # Add content length for integrity checks
-                    chunk_record["metadata"]["content_len"] = len(cleaned_text)
-                    # Update ID to include chunk info
-                    # Ensure each chunk has a unique vector ID to avoid upsert overwrites in Pinecone
-                    # Example: "<SKU>::chunk-1-of-3"
-                    chunk_record["id"] = f"{original_id}::chunk-{chunk_idx+1}-of-{len(text_chunks)}"
-                    final_records.append(chunk_record)
+            cleaned_text = re.sub(r"\s+", " ", original_text).strip()
+            single_rec = record.copy()
+            single_rec["metadata"] = record["metadata"].copy()
+            # Build a concise identity header from available metadata fields to help disambiguate similar content
+            _m = single_rec["metadata"]
+            header_kv = []
+            for key, label in [
+                ("sku", "SKU"),
+                ("brand", "Brand"),
+                ("product_name", "Product"),
+                ("product_line", "Product Line"),
+                ("shade", "Shade"),
+                ("category", "Category"),
+                ("sub_category", "Sub Category"),
+                ("leaf_level_category", "Leaf Level Category"),
+            ]:
+                val = _m.get(key)
+                if val:
+                    header_kv.append(f"{label}={val}")
+            identity_header = f"[ {'; '.join(header_kv)} ]" if header_kv else ""
+            prefixed_text = f"{identity_header}\n\n{cleaned_text}" if identity_header else cleaned_text
+
+            single_rec["metadata"]["content"] = prefixed_text
+            single_rec["metadata"]["chunk_index"] = 0
+            single_rec["metadata"]["total_chunks"] = 1
+            single_rec["metadata"]["content_len"] = len(prefixed_text)
+            # Parent ID is the section id itself for traceability
+            single_rec["metadata"]["parent_id"] = record["id"]
+            final_records.append(single_rec)
         
         # Generate embeddings for all final texts
         final_texts = [r["metadata"]["content"] for r in final_records]

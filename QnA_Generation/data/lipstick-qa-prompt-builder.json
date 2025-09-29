@@ -10,11 +10,21 @@ const prompt = {
     brand: brand,
     product_name: productName,
     shade: shade,
-    spectrophotometer_data: "Optional - L*, a*, b*, C*, h°, sRGB values, Gloss, and opacity when provided"
+    spectrophotometer_data: {
+      description: "L*, a*, b*, C*, h°, sRGB values, Gloss, and opacity when provided",
+      INTELLIGENT_APPLICATION: {
+        "L_value": "Use to predict opacity (>70=sheer, 40-70=medium, <40=opaque) and contrast on different skin depths",
+        "a_b_ratio": "Calculate undertone: +a/+b>1 = warm-leaning, +a/-b = cool purple, -a/+b = olive/green cast",
+        "C_chroma": "Determine vibrancy: >30=vivid, 15-30=moderate, <15=muted. Affects mixing and layering potential",
+        "h_hue_angle": "Position on color wheel: 0°=red, 30°=orange-red, 60°=orange, 340°=red-violet. Use for complementary pairings",
+        "gloss_value": "Predict light reflection and dimension: >60=high shine, 20-60=satin, <20=matte",
+        "opacity": "Combine with L* for coverage prediction and layering behavior"
+      }
+    }
   },
   
   GLOBAL_RULES: {
-    no_undertone_repeats_after_section_1: "NEVER mention skin tones/undertones/MAC codes outside Section 1. Section 4 MUST use preference/behavior descriptors instead.",
+    no_undertone_repeats_after_section_1: "NEVER mention skin tones/undertones/MAC codes in Section 2 and 3.",
     consistency_critical: "Never contradict yourself between sections. If you say 'heavy transfer' in Section 3, don't say 'minimal transfer' in Section 4."
   },
   
@@ -23,14 +33,19 @@ const prompt = {
     tone: "Academic but accessible - educate without being condescending",
     no_sass: "Keep WHY sections professional and informative - save personality for main answers",
     content: [
-      "Color theory explanations",
-      "Formulation science (general principles, not invented specifics)",
-      "How undertones interact with pigments",
-      "Why heat/humidity affects formulas",
-      "Scientific reasoning behind performance"
+      "Color theory explanations using actual color science principles",
+      "Formulation science connecting behavior to chemistry",
+      "How undertones interact with pigments through optical physics",
+      "Why heat/humidity affects formulas through phase chemistry",
+      "Scientific reasoning behind performance using molecular interactions",
+      "Connect research findings to scientific principles"
     ],
     language: "Use technical terms appropriately but explain them if complex",
-    example: "WHY: Cool-toned pigments contain blue and purple undertones that create visual discord with warm skin's yellow-based melanin, resulting in a grayish cast. The degree of clash depends on the pigment's saturation and depth - muted shades create less jarring contrast than vivid ones."
+    ENHANCED_DEPTH: {
+      "post_research_application": "After research, use scientific knowledge to explain WHY the product behaves as described",
+      "be_specific": "Don't just say 'pigments interact' - explain the specific mechanism",
+      "connect_dots": "Link observed behavior to formulation chemistry"
+    }
   },
   
   RESEARCH_REQUIREMENTS: {
@@ -96,7 +111,30 @@ const prompt = {
     RULE: "Transform all research into authoritative expert voice"
   },
   
-  task: `Generate an honest Q&A Diagnostic Report for ${brand} ${productName} in shade ${shade}. Create 40+ Q&As across sections 1-4 with specific, non-generic information, plus a comprehensive ingredient and pairing analysis in section 5. Every answer must provide concrete details specific to THIS lipstick.`,
+  POST_RESEARCH_ANALYSIS: {
+    CRITICAL: "After completing research, apply deep formulation and color science knowledge to synthesize findings",
+    
+    INTELLIGENT_SYNTHESIS: {
+      "pattern_recognition": "Identify formulation patterns from performance descriptions across reviews",
+      "scientific_explanation": "Use chemistry and physics to explain WHY reviews report certain behaviors",
+      "predictive_analysis": "Based on confirmed ingredients/finish, predict unstated performance aspects",
+      "technical_depth": "Go beyond surface observations to molecular-level understanding"
+    },
+    
+    COLOR_SCIENCE_APPLICATION: {
+      "undertone_analysis": "From shade descriptions, calculate position on color wheel and predict interactions",
+      "optical_behavior": "Explain how particle size, refractive index affect perceived color",
+      "skin_chemistry": "How pH, oils, melanin concentration affect final shade appearance"
+    },
+    
+    FORMULATION_INTELLIGENCE: {
+      "structure_function": "Connect confirmed ingredients to specific performance outcomes",
+      "synergistic_effects": "Explain how ingredient combinations create observed effects",
+      "degradation_pathways": "Predict how formula might change over time/temperature"
+    }
+  },
+  
+  task: `Generate an honest Q&A Diagnostic Report for ${brand} ${productName} in shade ${shade}. Create 40+ Q&As across sections 1-4 with specific, non-generic information, plus a comprehensive ingredient and pairing analysis in section 5. Every answer must provide concrete details specific to THIS lipstick. At the end, note the extensive research conducted.`,
   
   PRIORITY_PRINCIPLE: {
     CRITICAL: "Focus on what matters MOST for THIS specific shade and formula. Different lipsticks have different standout issues or benefits - lead with those. This naturally creates variety.",
@@ -125,7 +163,15 @@ const prompt = {
     
     SPECTROPHOTOMETER_INTEGRATION: {
       when_provided: "Use L*, a*, b*, C*, h°, sRGB, Gloss, and opacity values to enhance accuracy",
-      presentation: "Apply findings naturally without mentioning technical data"
+      presentation: "Apply findings naturally without mentioning technical data",
+      ADVANCED_APPLICATION: {
+        "simultaneous_contrast": "Explain how surrounding colors (skin, clothing) affect perception",
+        "metamerism": "Predict color shifts between daylight (D65), fluorescent (F2), incandescent (A) based on pigment type",
+        "chromatic_adaptation": "How shade appears to shift as eyes adjust over wear time",
+        "color_constancy": "Why shade may look different in store vs home lighting",
+        "complementary_harmony": "Use hue angle to calculate exact opposite for eye/cheek pairings"
+      }
+    },
     section_5: {
       title: "The Formula Breakdown: Ingredients, Safety & Perfect Pairings",
       requirements: [
@@ -208,16 +254,40 @@ const prompt = {
   },
   
   FORMULATION_BASICS: {
-    creamy: "Comfortable with higher slip/transfer; typical wear a couple of hours between touch-ups",
-    matte: "Lower transfer after set; can feel dry over time; many last through much of a workday",
-    liquid_matte_film_former: "Sets to a film; lowest transfer; longest wear but can feel drying",
-    stain_tint: "Low transfer once set; color lingers though shine fades",
-    balm_gloss: "High slip/transfer; short wear; comfort and shine focus",
-    temperature: "Around 30°C most formulas behave normally; at ~45°C many soften → more slip/transfer (esp. creamy/balm)"
+    note: "These are examples - apply knowledge to any formula type encountered in research",
+    examples: {
+      creamy: "Comfortable with higher slip/transfer; typical wear a couple of hours between touch-ups",
+      matte: "Lower transfer after set; can feel dry over time; many last through much of a workday",
+      liquid_matte_film_former: "Sets to a film; lowest transfer; longest wear but can feel drying",
+      stain_tint: "Low transfer once set; color lingers though shine fades",
+      balm_gloss: "High slip/transfer; short wear; comfort and shine focus",
+      temperature: "Around 30°C most formulas behave normally; at ~45°C many soften → more slip/transfer (esp. creamy/balm)"
+    },
+    
+    SCIENTIFIC_FRAMEWORK: {
+      note: "Apply these principles to explain behavior of any formula type",
+      "glass_transition_temperature": "Explains why formulas change behavior at different temps",
+      "rheology_principles": "Affects application feel and spreading",
+      "surface_tension": "Impacts spreading and transfer resistance",
+      "particle_size": "Affects texture and opacity",
+      "phase_behavior": "Determines longevity and removal method"
+    }
   },
   
   LANGUAGE_RULES: {
-    undertones: "Use 'golden/yellow skin' or 'pink-toned skin'; if needed, add (warm/cool) in brackets",
+    undertones: {
+      CRITICAL_RULE: "NEVER write 'warm undertone' or 'cool undertone' as primary descriptors in main answers",
+      MANDATORY_FORMAT: "ALWAYS use color descriptors: 'golden skin', 'yellow-toned', 'pink-toned', 'peachy', 'olive'",
+      BRACKETS_ONLY: "Terms 'warm' and 'cool' can ONLY appear in brackets as clarification after color descriptor",
+      EXAMPLES: {
+        WRONG: "looks great on warm undertones",
+        WRONG_2: "flatters cool-toned skin",
+        RIGHT: "looks great on golden skin (warm)",
+        RIGHT_2: "flatters pink-toned complexions (cool)",
+        RIGHT_3: "perfect for yellow undertones"
+      },
+      ENFORCEMENT: "This applies to ALL main answers in ALL sections. WHY sections can use technical terms freely."
+    },
     quantifiers: "Use descriptive terms, not percentages (e.g., 'mostly opaque')",
     time: "Use relatable spans (e.g., 'through your morning') instead of exact hours unless verified",
     temperature_context: "Reference Indian climates when relevant (e.g., humid monsoon, dry heat) without stereotyping cities",
@@ -260,6 +330,7 @@ const prompt = {
     PRICING_BAN: "NEVER write currency symbols, numbers for price/size anywhere. No '$18', '0.04 oz', 'Rs 2500'. Only 'budget/mid-range/expensive'.",
     NO_REPETITION: "Section 4 should not repeat information from sections 1-3, only build upon or explore new angles",
     NO_VAGUE_ANSWERS: "Every answer in Section 4 must be specific to THIS lipstick, not generic beauty advice",
+    RESEARCH_ACKNOWLEDGMENT: "At the very end of the report, briefly note that this analysis is based on extensive multi-platform research",
     violations_to_avoid: {
       section_4_bad: "Anyone seeking their perfect berry shade",
       section_4_good: "Anyone who wants a soft-blur berry that layers without patchiness"
@@ -335,9 +406,11 @@ const prompt = {
           "Give specific techniques that work for THIS texture/finish",
           "Compare to specific benchmarks when making claims"
         ],
-        example_transformations: {
-          vague: "This lipstick photographs well in different lighting",
-          specific: "This shade's blue undertones make it appear more vibrant in cool LED lighting but can look slightly muted in warm incandescent bulbs - ideal for Instagram's cool-toned filters but may need warming up for golden hour shots"
+        specificity_guidelines: {
+          approach: "Transform general observations into technically accurate, specific insights",
+          methodology: "Identify the scientific principle behind each behavior and explain it precisely",
+          depth_requirement: "Each answer should reveal understanding of the underlying chemistry, physics, or biology",
+          connection_to_product: "Always tie scientific principles back to THIS specific shade's measured or observed characteristics"
         }
       },
       
@@ -379,6 +452,7 @@ const prompt = {
         "WEAR PATTERNS: Fading pattern, eating/drinking survival, mask-wearing performance, kiss-proof rating",
         "OCCASION MAPPING: Office appropriateness, date night performance, wedding guest suitability, travel-friendliness",
         "CLIMATE PERFORMANCE: AC survival, humidity resistance, winter drying, summer melting point",
+        "ADVANCED_CLIMATE_SCIENCE: Phase transition temps, humidity absorption isotherms, UV degradation rates, vapor pressure effects",
         "SKIN CONDITIONS: Performance on dry/oily/combination lips, over fillers, with eczema/allergies",
         "AGE CONSIDERATIONS: Settling into lines, teeth whitening effect, age-appropriate styling",
         "CULTURAL CONTEXT: Festival wear, professional settings in India, photogenic for selfies",
@@ -514,7 +588,8 @@ const prompt = {
       section_4: "30+ comprehensive Q&As covering everything else - each with specific, non-generic information",
       section_5: "Complete ingredient analysis and pairing guide",
       total: "40+ Q&As across sections 1-4, plus comprehensive section 5"
-    }
+    },
+    final_note: "End with brief acknowledgment of extensive research conducted"
   }
 };
 

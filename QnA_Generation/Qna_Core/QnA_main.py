@@ -51,9 +51,27 @@ from typing import Any, Dict, List, Tuple
 import requests
 from dotenv import load_dotenv
 import subprocess
+import hashlib
+from anthropic import Anthropic
+from anthropic._exceptions import APIError as AnthropicAPIError
+try:
+    # Type helpers for batches (available in recent anthropic SDKs)
+    from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
+    from anthropic.types.messages.batch_create_params import Request as BatchRequest
+except Exception:  # SDK may not expose types; we'll fall back to plain dicts
+    MessageCreateParamsNonStreaming = None  # type: ignore
+    BatchRequest = None  # type: ignore
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 DEFAULT_MODEL = "claude-opus-4-1-20250805"  # From your example
+# Default batch size for Anthropic Message Batches (change here if needed)
+BATCH_SIZE_DEFAULT = 3
+# Default temperature for both sync and batch calls
+DEFAULT_TEMPERATURE = 0.5
+
+# Control extra artifact creation without CLI args
+WRITE_RAW_FULL: bool = False
+WRITE_AUDIT_FILES: bool = False
 
 # ------------------------------
 # Logging Setup
@@ -104,9 +122,7 @@ def read_prompt(path: str) -> str:
         return content
 
 
-def read_schema_json(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+ 
 
 
 def extract_first_json_object(text: str) -> str | None:
@@ -293,6 +309,332 @@ def trigger_ingestion(json_path: str, logger: logging.Logger) -> bool:
 
 
 # ------------------------------
+# Batch mode (Anthropic Message Batches API)
+# ------------------------------
+
+def _build_shared_system_blocks(prompt_text: str) -> List[Dict[str, Any]]:
+    """Return a system array with a small uncached header + a large cached block.
+    We keep the large block byte-stable and mark it with cache_control so batches can reuse it.
+    Always uses the inline REQUIRED JSON FORMAT (no external schema).
+    """
+    # Small uncached header (stable too, but usually tiny)
+    header = {
+        "type": "text",
+        "text": textwrap.dedent(
+            """
+            You are an expert Q&A generator for cosmetics. Follow the formatting and constraints exactly.
+            Output strictly valid JSON only. No markdown.
+            """
+        ).strip() + "\n"
+    }
+
+    # Large cached template: prompt + required JSON SHAPE (inline only)
+    required_format = textwrap.dedent(
+        """
+        {
+          "product": {
+            "brand": "...",
+            "product_line": "...",
+            "shade": "...",
+            "full_name": "...",
+            "sku": "...",
+            "category": "...",
+            "sub_category": "...",
+            "leaf_level_category": "..."
+          },
+          "sections": [
+            {
+              "title": "Section title here",
+              "qas": [
+                {
+                  "q": "question here",
+                  "a": "answer here",
+                  "why": "explanation here",
+                  "solution": "solution here (include this key even if empty)"
+                }
+              ]
+            }
+          ]
+        }
+        """
+    ).strip()
+
+    big_block = {
+        "type": "text",
+        "text": textwrap.dedent(
+            f"""
+            {prompt_text}
+
+            CRITICAL FORMATTING REQUIREMENTS:
+            - Return ONLY valid JSON (no markdown, no commentary)
+            - Treat the JSON below as a SHAPE EXAMPLE (keys and nesting) only; do NOT copy the number of sections or QAs from it
+            - Do NOT include code fences (```), markdown, prose, or any text before/after the JSON
+            - Follow the section and QA counts from the PROMPT'S STRUCTURE 
+            - Expand arrays to meet the PROMPT requirements even if the example shows fewer items
+            - Use the exact product keys shown (including "sku", "category", "sub_category", "leaf_level_category"); keys must always be present (empty string allowed if unknown)
+            - Do NOT include any citations, footnotes, source markers, or attribution (e.g., <cite ...>...</cite>, [1], (ref), URLs). Present everything as expert knowledge.
+
+            REQUIRED JSON FORMAT:
+            {required_format}
+            """
+        ).strip(),
+        # Cache the big block for reuse across requests in a batch
+        "cache_control": {"type": "ephemeral"},
+    }
+
+    return [header, big_block]
+
+
+def _make_custom_id(row: Dict[str, str]) -> str:
+    sku = (row.get("sku") or "").strip()
+    if sku:
+        return sku
+    return f"{(row.get('brand') or '').strip()}-{(row.get('product_name') or '').strip()}-{(row.get('shade_of_lipstick') or '').strip()}" or "unknown"
+
+
+def run_batch_generation(
+    api_key: str,
+    model: str,
+    rows: List[Dict[str, str]],
+    prompt_text: str,
+    max_tokens: int,
+    batch_size: int,
+    output_dir: str,
+    logger: logging.Logger,
+    no_ingest: bool = False,
+) -> Tuple[int, int, int, int]:
+    """Send rows to Anthropic Message Batches in groups and process results.
+    Returns (ok_count, fail_count, total_input_tokens, total_output_tokens).
+    """
+    client = Anthropic(api_key=api_key)
+    ok, fail = 0, 0
+    total_input_tokens, total_output_tokens = 0, 0
+
+    shared_system = _build_shared_system_blocks(prompt_text)
+
+    for i in range(0, len(rows), batch_size):
+        wave = rows[i:i+batch_size]
+        requests_payload: List[Any] = []
+        for row in wave:
+            # Build per-product user message (JSON product info)
+            _, user_text = build_user_message(prompt_text, row, use_natural_generation=True)
+
+            # If typed classes are available, use them; else fall back to dicts
+            params = {
+                "model": model,
+                "max_tokens": max_tokens,
+                "temperature": DEFAULT_TEMPERATURE,
+                "system": shared_system,
+                "messages": [{"role": "user", "content": user_text}],
+                # Ensure batch requests mirror the sync path by enabling web_search tool
+                "tools": [
+                    {
+                        "type": "web_search_20250305",
+                        "name": "web_search",
+                        "max_uses": 5,
+                    }
+                ],
+            }
+            custom_id = _make_custom_id(row)
+
+            if MessageCreateParamsNonStreaming and BatchRequest:
+                requests_payload.append(
+                    BatchRequest(
+                        custom_id=custom_id,
+                        params=MessageCreateParamsNonStreaming(**params)
+                    )
+                )
+            else:
+                # Fallback compatible with SDK expecting dicts
+                requests_payload.append({"custom_id": custom_id, "params": params})
+
+        try:
+            logger.info("Submitting batch: %s requests (items %s-%s)", len(requests_payload), i+1, i+len(wave))
+            batch = client.messages.batches.create(requests=requests_payload)
+            batch_id = getattr(batch, "id", None) or batch["id"]  # type: ignore
+            logger.info("Batch submitted: id=%s", batch_id)
+
+            # Poll until completed
+            while True:
+                status_obj = client.messages.batches.retrieve(batch_id)
+                status = getattr(status_obj, "processing_status", None)
+                logger.info("Batch %s status: %s", batch_id, status)
+                if status is None:
+                    logger.warning("Batch %s status response missing processing_status: %r", batch_id, status_obj)
+                    break
+                if status in ("ended", "completed", "cancelled", "expired", "failed"):
+                    break
+                time.sleep(3)
+
+            # Fetch results once: materialize JSONL decoder and log per-item errors
+            results_iter = client.messages.batches.results(batch_id)
+            try:
+                raw_results = list(results_iter)  # JSONL decoder -> list of items
+            except Exception:
+                # Fallback for SDKs that return an object with .data
+                raw_results = getattr(results_iter, "data", None) or results_iter.get("data", [])  # type: ignore
+
+            # First pass over concrete list: surface errors
+            for item in raw_results:
+                try:
+                    custom_id_iter = getattr(item, "custom_id", None)
+                    result_obj = getattr(item, "result", None)
+                    # SDK shape: errored -> result.error.error.message
+                    err_wrapper = getattr(result_obj, "error", None)
+                    err_inner = getattr(err_wrapper, "error", None)
+                    err_msg = (
+                        getattr(err_inner, "message", None)
+                        or getattr(err_wrapper, "message", None)
+                        or None
+                    )
+                    if err_msg:
+                        logger.error("Batch item failed: %s -> %s", custom_id_iter, err_msg)
+                except Exception:
+                    # Best-effort logging; don't break on a single malformed item
+                    continue
+
+            items = raw_results
+            logger.info("Batch %s returned %s results", batch_id, len(items))
+
+            # Process each result item
+            for item in items:
+                custom_id = getattr(item, "custom_id", None)
+                result_obj = getattr(item, "result", None)
+
+                # If not succeeded, mark as failed and continue
+                if getattr(result_obj, "type", None) != "succeeded":
+                    # Try to log an error message
+                    err_wrapper = getattr(result_obj, "error", None)
+                    err_inner = getattr(err_wrapper, "error", None)
+                    err_msg = (
+                        getattr(err_inner, "message", None)
+                        or getattr(err_wrapper, "message", None)
+                        or None
+                    )
+                    if err_msg:
+                        logger.error("Batch item failed for %s: %s", custom_id, err_msg)
+                    # Update checkpoint for this row
+                    row = next((r for r in wave if _make_custom_id(r) == custom_id), None)
+                    if row:
+                        update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
+                    fail += 1
+                    continue
+
+                # Succeeded: get the message payload
+                message = getattr(result_obj, "message", None)
+
+                # Try to find the corresponding row
+                row = next((r for r in wave if _make_custom_id(r) == custom_id), None)
+                if not row:
+                    logger.warning("Result with custom_id=%s has no matching input row", custom_id)
+                    fail += 1
+                    continue
+
+                filename = create_output_filename(row)
+                filepath = os.path.join(output_dir, filename)
+
+                # Cache metrics per item (best-effort: try multiple locations)
+                try:
+                    cache_status = None
+                    cache_token_credits = None
+                    usage = getattr(message, "usage", None)
+                    # Some SDKs surface headers or metadata differently; probe common spots
+                    headers = (
+                        getattr(message, "response_headers", None)
+                        or getattr(message, "headers", None)
+                        or getattr(item, "response_headers", None)
+                        or getattr(item, "headers", None)
+                        or {}
+                    )
+                    if isinstance(headers, dict):
+                        cache_status = headers.get("anthropic-cache-status") or headers.get("x-anthropic-cache-status")
+                        cache_token_credits = headers.get("anthropic-cache-token-credits")
+                    # In some cases, cache info may be copied into usage
+                    if isinstance(usage, dict):
+                        cache_status = cache_status or usage.get("anthropic-cache-status")
+                        cache_token_credits = cache_token_credits or usage.get("anthropic-cache-token-credits")
+                    if cache_status or cache_token_credits:
+                        logger.info(
+                            "[batch][cache] custom_id=%s status=%s token_credits=%s", custom_id, cache_status, cache_token_credits
+                        )
+                    else:
+                        logger.info("[batch][cache] custom_id=%s status=%s", custom_id, None)
+                except Exception as _:
+                    logger.debug("Failed to read cache headers for custom_id=%s", custom_id)
+
+                # Extract text parts from non-streaming result
+                try:
+                    content_blocks = getattr(message, "content", None) or []
+                    parts = []
+                    for c in content_blocks:
+                        if getattr(c, "type", None) == "text":
+                            parts.append(getattr(c, "text", ""))
+                    # Use only the FINAL text block as the model's answer
+                    text = (parts[-1] if parts else "").strip()
+                    raw_for_parse = extract_first_json_object(text) or text
+                    obj = json.loads(raw_for_parse)
+                    # Accumulate token usage if present
+                    usage = getattr(message, "usage", None)
+                    try:
+                        if isinstance(usage, dict):
+                            in_tok = int(usage.get("input_tokens", 0) or 0)
+                            out_tok = int(usage.get("output_tokens", 0) or 0)
+                        else:
+                            # Anthropic SDK Usage is a Pydantic model; read attributes
+                            in_tok = int(getattr(usage, "input_tokens", 0) or 0)
+                            out_tok = int(getattr(usage, "output_tokens", 0) or 0)
+                        total_input_tokens += in_tok
+                        total_output_tokens += out_tok
+                        try:
+                            logger.info("[batch][usage] custom_id=%s in=%s out=%s", custom_id, in_tok, out_tok)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logger.error("Failed to parse batch item %s JSON: %s", custom_id, e)
+                    update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
+                    fail += 1
+                    continue
+
+                # Save output JSON
+                try:
+                    with open(filepath, "w", encoding="utf-8") as out:
+                        json.dump(obj, out, ensure_ascii=False, indent=2)
+                except Exception as e:
+                    logger.error("Failed to write output for %s: %s", filename, e)
+                    update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
+                    fail += 1
+                    continue
+
+                # Trigger ingestion (honor no_ingest like the sync path)
+                ing_ok = True
+                if not no_ingest:
+                    ing_ok = trigger_ingestion(filepath, logger)
+                else:
+                    logger.info("Auto-ingest disabled via --no_ingest; skipping ingestion for %s", filepath)
+                update_checkpoint(output_dir, row, ing_ok, load_checkpoint(output_dir))
+                if ing_ok:
+                    ok += 1
+                else:
+                    fail += 1
+
+        except AnthropicAPIError as e:
+            logger.error("Batch API error: %s", e)
+            # Mark all rows in this wave as failed in the checkpoint so reruns track them
+            for row in wave:
+                update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
+            fail += len(wave)
+        except Exception as e:
+            logger.error("Unexpected error during batch submission/processing: %s", e)
+            for row in wave:
+                update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
+            fail += len(wave)
+
+    return ok, fail, total_input_tokens, total_output_tokens
+
+
+# ------------------------------
 # Checkpoint System
 # ------------------------------
 
@@ -406,7 +748,7 @@ def is_product_completed(product_row: Dict[str, str], checkpoint_data: Dict[str,
     return product_id in checkpoint_data.get("completed_products", [])
 
 
-def build_user_message(prompt_text: str, product_row: Dict[str, str], schema_obj: Dict[str, Any] = None, use_natural_generation: bool = True) -> Tuple[str, str]:
+def build_user_message(prompt_text: str, product_row: Dict[str, str], use_natural_generation: bool = True) -> Tuple[str, str]:
     # Map CSV fields to the schema keys commonly used in your lipstick template
     product_for_model = {
         "brand": product_row["brand"],
@@ -429,41 +771,39 @@ def build_user_message(prompt_text: str, product_row: Dict[str, str], schema_obj
         "gloss": product_row.get("gloss", ""),
     }
 
-    if use_natural_generation:
-        # Build a STATIC system message (cacheable) with prompt_text and REQUIRED JSON FORMAT (no product interpolation)
-        if schema_obj:
-            required_format = json.dumps(schema_obj, ensure_ascii=False, indent=2)
-        else:
-            # Minimal static template if schema is not provided
-            required_format = textwrap.dedent(
-                """
+    # Inline REQUIRED JSON FORMAT shared by both branches
+    required_format = textwrap.dedent(
+        """
+        {
+          "product": {
+            "brand": "...",
+            "product_line": "...",
+            "shade": "...",
+            "full_name": "...",
+            "sku": "...",
+            "category": "...",
+            "sub_category": "...",
+            "leaf_level_category": "..."
+          },
+          "sections": [
+            {
+              "title": "Section title here",
+              "qas": [
                 {
-                  "product": {
-                    "brand": "...",
-                    "product_line": "...",
-                    "shade": "...",
-                    "full_name": "...",
-                    "sku": "...",
-                    "category": "...",
-                    "sub_category": "...",
-                    "leaf_level_category": "..."
-                  },
-                  "sections": [
-                    {
-                      "title": "Section title here",
-                      "qas": [
-                        {
-                          "q": "question here",
-                          "a": "answer here",
-                          "why": "explanation here",
-                          "solution": "solution here (include this key even if empty)"
-                        }
-                      ]
-                    }
-                  ]
+                  "q": "question here",
+                  "a": "answer here",
+                  "why": "explanation here",
+                  "solution": "solution here (include this key even if empty)"
                 }
-                """
-            ).strip()
+              ]
+            }
+          ]
+        }
+        """
+    ).strip()
+
+    if use_natural_generation:
+        # Build a STATIC system message (cacheable) with prompt_text and REQUIRED JSON FORMAT (inline only)
 
         system_text = textwrap.dedent(
             f"""
@@ -472,17 +812,14 @@ def build_user_message(prompt_text: str, product_row: Dict[str, str], schema_obj
             CRITICAL FORMATTING REQUIREMENTS:
             - Return ONLY valid JSON (no markdown, no commentary)
             - Treat the JSON below as a SHAPE EXAMPLE (keys and nesting) only; do NOT copy the number of sections or QAs from it
-            - Follow the section and QA counts from the PROMPT'S STRUCTURE (exactly 5 sections, with the required QAs per section)
+            - Do NOT include code fences (```), markdown, prose, or any text before/after the JSON
+            - Follow the section and QA counts from the PROMPT'S STRUCTURE 
             - Expand arrays to meet the PROMPT requirements even if the example shows fewer items
             - Use the exact product keys shown (including "sku", "category", "sub_category", "leaf_level_category"); keys must always be present (empty string allowed if unknown)
             - Do NOT include any citations, footnotes, source markers, or attribution (e.g., <cite ...>...</cite>, [1], (ref), URLs). Present everything as expert knowledge.
 
             REQUIRED JSON FORMAT:
             {required_format}
-            
-            Additional requirements:
-            - Under product, include keys: "category", "sub_category", and "leaf_level_category".
-            - These keys must always be present (empty string allowed if not provided).
             """
         ).strip()
 
@@ -496,24 +833,7 @@ def build_user_message(prompt_text: str, product_row: Dict[str, str], schema_obj
 
         return system_text, user_text
     else:
-        # Use fixed template (fallback): system contains prompt + schema; user contains product info
-        system_text = textwrap.dedent(
-            f"""
-            <<PROMPT>>
-            {prompt_text}
-
-            <<OUTPUT FORMAT>>
-            You MUST output valid JSON only that exactly matches this format (keys and types):
-            {json.dumps(schema_obj or {}, ensure_ascii=False, indent=2)}
-            """
-        ).strip()
-        user_text = textwrap.dedent(
-            f"""
-            <<PRODUCT>>
-            {json.dumps(product_for_model, ensure_ascii=False, indent=2)}
-            """
-        ).strip()
-        return system_text, user_text
+        raise ValueError("use_natural_generation=False is not supported. Refusing to build an alternate prompt shape.")
 
 
 # ------------------------------
@@ -536,22 +856,28 @@ def call_claude_with_web_search(api_key: str, model: str, user_content: str, max
     payload: Dict[str, Any] = {
         "model": model,
         "max_tokens": max_tokens,
-        "temperature": 0.5,
-        "messages": [
-            {"role": "user", "content": user_content}
-        ],
+        "temperature": DEFAULT_TEMPERATURE,
+        "messages": [{"role": "user", "content": user_content}],
         # IMPORTANT: Use Anthropic's built-in web search tool per your example
         "tools": [
             {
                 "type": "web_search_20250305",
                 "name": "web_search",
-                "max_uses": 4
+                "max_uses": 5,
             }
         ],
     }
     
     # Inject cacheable system message (prompt caching) if provided
     if system_text:
+        # Log a stable hash of the system text to ensure byte-for-byte stability across requests
+        try:
+            sys_hash = hashlib.sha256((system_text or "").encode("utf-8")).hexdigest()
+            logger.info("System text hash: %s", sys_hash)
+        except Exception:
+            pass
+
+        # Use ephemeral caching (no ttl_seconds; not permitted on some endpoints)
         payload["system"] = [
             {
                 "type": "text",
@@ -614,17 +940,12 @@ def call_claude_with_web_search(api_key: str, model: str, user_content: str, max
             pass
         request_time = time.time() - start_time
         
-        # The response content is a list of blocks; accumulate only text parts
+        # The response content is a list of blocks; take only the FINAL text block
         parts = []
         for c in data.get("content", []):
-            ctype = c.get("type")
-            if ctype == "text":
+            if c.get("type") == "text":
                 parts.append(c.get("text", ""))
-            else:
-                # Tool activity logging disabled per user request; ignore non-text blocks
-                continue
-
-        text = "".join(parts).strip()
+        text = (parts[-1] if parts else "").strip()
 
         # Strip accidental code fences if present
         if text.startswith("```") and text.endswith("```"):
@@ -687,6 +1008,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Lipstick QnA generator with web search")
     parser.add_argument("--debug", action="store_true", help="Enable per-product debug dumps under output/debug/")
     parser.add_argument("--no_ingest", action="store_true", help="Disable automatic Pinecone ingestion after writing each JSON output")
+    # Batch is ON by default. Use --no_batch to fall back to synchronous single-request mode.
+    parser.add_argument("--no_batch", action="store_true", help="Disable Anthropic Message Batches API and use synchronous requests")
+    parser.add_argument("--no_sidecars", action="store_true", help="Do not write raw/audit sidecar files alongside the main JSON output")
     args, unknown = parser.parse_known_args()
     # Hardcoded file paths
     prompt_path = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/data/lipstick-qa-prompt-builder.json"
@@ -742,9 +1066,7 @@ def main() -> None:
         prompt_text = read_prompt(prompt_path)
         logger.info(f"Loaded prompt from: {prompt_path}")
         
-        # Use inline shape-only REQUIRED JSON FORMAT; no external schema file
-        schema_obj = None
-        logger.info("Using inline shape-only REQUIRED JSON FORMAT (no external schema file)")
+        # Always use inline shape-only REQUIRED JSON FORMAT; no external schema file
         
         rows = read_rows(input_csv)
         logger.info(f"Loaded {len(rows)} products from: {input_csv}")
@@ -782,8 +1104,65 @@ def main() -> None:
     # Prepare debug directory if enabled
     debug_root = os.path.join(output_dir, "debug") if args.debug else None
 
-    # One-time Helicone status log flag
-    helicone_status_logged = False
+
+    # Batch mode: use Anthropic Message Batches API
+    if not args.no_batch:
+        batch_size = BATCH_SIZE_DEFAULT
+        logger.info("Running in BATCH mode (default): batch_size=%s", batch_size)
+        ok, fail, batch_in_tokens, batch_out_tokens = run_batch_generation(
+            api_key=api_key,
+            model=model,
+            rows=remaining_rows,
+            prompt_text=prompt_text,
+            max_tokens=max_tokens,
+            batch_size=batch_size,
+            output_dir=output_dir,
+            logger=logger,
+            no_ingest=args.no_ingest,
+        )
+        session_ok += ok
+        session_fail += fail
+        total_input_tokens += batch_in_tokens
+        total_output_tokens += batch_out_tokens
+        # Reload checkpoint to avoid stale stats before final summary
+        checkpoint_data = load_checkpoint(output_dir)
+        # Skip synchronous loop and proceed to final stats
+        total_time = time.time() - start_time
+        session_stats = {
+            "timestamp": datetime.now().isoformat(),
+            "processed": session_ok + session_fail,
+            "successful": session_ok,
+            "failed": session_fail,
+            "duration_seconds": total_time,
+            "tokens_used": total_input_tokens + total_output_tokens
+        }
+        checkpoint_data["session_stats"].append(session_stats)
+        save_checkpoint(output_dir, checkpoint_data)
+        logger.info("= " * 30)
+        logger.info("QnA Generation Session Completed (BATCH mode)")
+        logger.info(f"End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"Session execution time: {total_time:.2f} seconds ({total_time/60:.2f} minutes)")
+        logger.info("")
+        logger.info("📊 SESSION STATISTICS:")
+        logger.info(f"   Products processed this session: {session_ok + session_fail}")
+        logger.info(f"   Successful this session: {session_ok}")
+        logger.info(f"   Failed this session: {session_fail}")
+        logger.info(f"   Skipped (file exists): {len(skipped_files)}")
+        logger.info(f"   Skipped (checkpoint): {skipped_checkpoint}")
+        logger.info("")
+        logger.info("📈 OVERALL STATISTICS:")
+        logger.info(f"   Total products in CSV: {len(rows)}")
+        logger.info(f"   Total completed: {checkpoint_data['successful']}")
+        logger.info(f"   Total failed: {checkpoint_data['failed']}")
+        logger.info(f"   Overall success rate: {(checkpoint_data['successful']/(checkpoint_data['successful']+checkpoint_data['failed'])*100):.1f}%" if (checkpoint_data['successful']+checkpoint_data['failed']) > 0 else "N/A")
+        logger.info(f"   Completion rate: {(checkpoint_data['successful']/len(rows)*100):.1f}%")
+        logger.info("")
+        logger.info(f"💰 Token usage this session: {total_input_tokens:,} input + {total_output_tokens:,} output = {total_input_tokens + total_output_tokens:,}")
+        logger.info(f"⏱️  Average time per product: {total_time/max(session_ok+session_fail, 1):.2f} seconds")
+        logger.info(f"📁 Output directory: {output_dir}")
+        logger.info(f"📋 Checkpoint file: {os.path.join(output_dir, 'checkpoint.json')}")
+        logger.info("= " * 30)
+        return
 
     for idx, row in enumerate(remaining_rows, 1):
         product_start_time = time.time()
@@ -802,7 +1181,7 @@ def main() -> None:
             # Attempt ingestion for existing files unless disabled
             if not args.no_ingest:
                 ing_ok = trigger_ingestion(filepath, logger)
-                update_checkpoint(output_dir, row, ing_ok, checkpoint_data)
+                update_checkpoint(output_dir, row, ing_ok, load_checkpoint(output_dir))
                 if not ing_ok:
                     logger.warning("Marked as failed due to ingestion failure for existing file: %s", filename)
             else:
@@ -810,6 +1189,12 @@ def main() -> None:
                 logger.info("Auto-ingest disabled via --no_ingest; marking existing file as completed: %s", filename)
             continue
         
+        # Compute per-product debug base path early (needed in reprocessing block below)
+        debug_basepath = None
+        if debug_root:
+            base_no_ext = os.path.splitext(filename)[0]
+            debug_basepath = os.path.join(debug_root, base_no_ext)
+
         # Reprocessing path: if a raw sidecar exists from a previous failed attempt, try to recover without calling the LLM
         try:
             base_no_ext = os.path.splitext(filename)[0]
@@ -841,7 +1226,7 @@ def main() -> None:
                             except Exception:
                                 logger.debug("Failed to write parsed JSON for %s", debug_basepath)
 
-                        # Trigger ingestion unless disabled
+                        # Trigger ingestion
                         ing_ok = True
                         if not args.no_ingest:
                             ing_ok = trigger_ingestion(filepath, logger)
@@ -849,7 +1234,7 @@ def main() -> None:
                             logger.info("Auto-ingest disabled via --no_ingest; skipping ingestion for %s", filepath)
 
                         # Update checkpoint and continue to next product
-                        update_checkpoint(output_dir, row, ing_ok, checkpoint_data)
+                        update_checkpoint(output_dir, row, ing_ok, load_checkpoint(output_dir))
                         if not ing_ok:
                             logger.warning("Marked as failed due to ingestion failure (reprocessed): %s", filename)
                         logger.info("✓ Row %s (reprocessed): SUCCESS -> %s", idx, filename)
@@ -861,13 +1246,7 @@ def main() -> None:
         except Exception as _e:
             logger.warning("Unexpected error during sidecar reprocessing path for %s: %s", filename, _e)
 
-        system_text, user_msg = build_user_message(prompt_text, row, schema_obj, use_natural_generation=True)
-
-        # Compute per-product debug base path
-        debug_basepath = None
-        if debug_root:
-            base_no_ext = os.path.splitext(filename)[0]
-            debug_basepath = os.path.join(debug_root, base_no_ext)
+        system_text, user_msg = build_user_message(prompt_text, row, use_natural_generation=True)
         
         try:
             raw, usage_info = call_claude_with_web_search(
@@ -908,28 +1287,30 @@ def main() -> None:
             with open(filepath, "w", encoding="utf-8") as out:
                 json.dump(obj, out, ensure_ascii=False, indent=2)
 
-            # Write raw-response and audit file to measure dropped content (if any)
-            try:
-                base_no_ext = os.path.splitext(filename)[0]
-                # Full raw text from the LLM
-                raw_full_txt_path = os.path.join(output_dir, f"{base_no_ext}.raw.full.txt")
-                with open(raw_full_txt_path, "w", encoding="utf-8") as f_raw_full:
-                    f_raw_full.write(raw)
-
-                # Audit JSON comparing raw chars vs parsed JSON chars
-                parsed_json_str = json.dumps(obj, ensure_ascii=False)
-                audit = {
-                    "filename": filename,
-                    "raw_chars": len(raw or ""),
-                    "parsed_json_chars": len(parsed_json_str),
-                    "dropped_chars": max(len(raw or "") - len(parsed_json_str), 0),
-                    "timestamp": datetime.now().isoformat(),
-                }
-                audit_path = os.path.join(output_dir, f"{base_no_ext}.audit.json")
-                with open(audit_path, "w", encoding="utf-8") as f_audit:
-                    json.dump(audit, f_audit, ensure_ascii=False, indent=2)
-            except Exception as _e:
-                logger.debug("Failed to write raw/audit sidecar files for %s: %s", filename, _e)
+            # Optionally write raw-response and/or audit file (disabled by default)
+            if WRITE_RAW_FULL or WRITE_AUDIT_FILES:
+                try:
+                    base_no_ext = os.path.splitext(filename)[0]
+                    if WRITE_RAW_FULL:
+                        # Full raw text from the LLM
+                        raw_full_txt_path = os.path.join(output_dir, f"{base_no_ext}.raw.full.txt")
+                        with open(raw_full_txt_path, "w", encoding="utf-8") as f_raw_full:
+                            f_raw_full.write(raw)
+                    if WRITE_AUDIT_FILES:
+                        # Audit JSON comparing raw chars vs parsed JSON chars
+                        parsed_json_str = json.dumps(obj, ensure_ascii=False)
+                        audit = {
+                            "filename": filename,
+                            "raw_chars": len(raw or ""),
+                            "parsed_json_chars": len(parsed_json_str),
+                            "dropped_chars": max(len(raw or "") - len(parsed_json_str), 0),
+                            "timestamp": datetime.now().isoformat(),
+                        }
+                        audit_path = os.path.join(output_dir, f"{base_no_ext}.audit.json")
+                        with open(audit_path, "w", encoding="utf-8") as f_audit:
+                            json.dump(audit, f_audit, ensure_ascii=False, indent=2)
+                except Exception as _e:
+                    logger.debug("Failed to write optional raw/audit files for %s: %s", filename, _e)
 
             # Optional debug: save parsed JSON as well (duplicate of output for quick diff)
             if debug_basepath:
@@ -939,7 +1320,7 @@ def main() -> None:
                 except Exception:
                     logger.debug("Failed to write parsed JSON for %s", debug_basepath)
 
-            # Trigger Pinecone ingestion for this freshly written JSON file unless disabled
+            # Trigger ingestion
             ing_ok = True
             if not args.no_ingest:
                 ing_ok = trigger_ingestion(filepath, logger)
@@ -950,7 +1331,7 @@ def main() -> None:
             session_ok += 1
             
             # Update checkpoint
-            update_checkpoint(output_dir, row, ing_ok, checkpoint_data)
+            update_checkpoint(output_dir, row, ing_ok, load_checkpoint(output_dir))
             if not ing_ok:
                 logger.warning("Marked as failed due to ingestion failure: %s", filename)
             

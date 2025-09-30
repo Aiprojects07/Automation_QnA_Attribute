@@ -312,7 +312,7 @@ def trigger_ingestion(json_path: str, logger: logging.Logger) -> bool:
 # Batch mode (Anthropic Message Batches API)
 # ------------------------------
 
-def _build_shared_system_blocks(prompt_text: str) -> List[Dict[str, Any]]:
+def _build_shared_system_blocks(prompt_text: str, use_cache: bool) -> List[Dict[str, Any]]:
     """Return a system array with a small uncached header + a large cached block.
     We keep the large block byte-stable and mark it with cache_control so batches can reuse it.
     Always uses the inline REQUIRED JSON FORMAT (no external schema).
@@ -378,10 +378,15 @@ def _build_shared_system_blocks(prompt_text: str) -> List[Dict[str, Any]]:
             {required_format}
             """
         ).strip(),
-        # Cache the big block for reuse across requests in a batch
-        "cache_control": {"type": "ephemeral"},
     }
-
+    # Attach cache control only when caching is enabled
+    # DIAGNOSTIC: log what use_cache actually is here
+    try:
+        logging.getLogger(__name__).info("_build_shared_system_blocks: use_cache=%r (type=%s)", use_cache, type(use_cache).__name__)
+    except Exception:
+        pass
+    if use_cache:
+        big_block["cache_control"] = {"type": "ephemeral"}
     return [header, big_block]
 
 
@@ -402,6 +407,7 @@ def run_batch_generation(
     output_dir: str,
     logger: logging.Logger,
     no_ingest: bool = False,
+    use_cache: bool = True,
 ) -> Tuple[int, int, int, int]:
     """Send rows to Anthropic Message Batches in groups and process results.
     Returns (ok_count, fail_count, total_input_tokens, total_output_tokens).
@@ -410,7 +416,11 @@ def run_batch_generation(
     ok, fail = 0, 0
     total_input_tokens, total_output_tokens = 0, 0
 
-    shared_system = _build_shared_system_blocks(prompt_text)
+    shared_system = _build_shared_system_blocks(prompt_text, use_cache)
+    try:
+        logger.info("Prompt caching (batch): %s", "ENABLED" if use_cache else "DISABLED")
+    except Exception:
+        pass
 
     for i in range(0, len(rows), batch_size):
         wave = rows[i:i+batch_size]
@@ -840,7 +850,7 @@ def build_user_message(prompt_text: str, product_row: Dict[str, str], use_natura
 # Anthropic call w/ built-in web search tool
 # ------------------------------
 
-def call_claude_with_web_search(api_key: str, model: str, user_content: str, max_tokens: int = 30000, debug_basepath: str | None = None, system_text: str | None = None) -> tuple[str, dict]:
+def call_claude_with_web_search(api_key: str, model: str, user_content: str, max_tokens: int = 30000, debug_basepath: str | None = None, system_text: str | None = None, use_cache: bool = True) -> tuple[str, dict]:
     """Call Claude API with retry logic and usage tracking."""
     logger = logging.getLogger(__name__)
     
@@ -848,10 +858,10 @@ def call_claude_with_web_search(api_key: str, model: str, user_content: str, max
         "x-api-key": api_key,
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
-        # Enable prompt caching (beta). This allows cache_control on the system block to be used and
-        # returns cache-related headers we can log.
-        "anthropic-beta": "prompt-caching-2024-07-31",
     }
+    # Add prompt caching beta header only when caching is enabled
+    if use_cache:
+        headers["anthropic-beta"] = "prompt-caching-2024-07-31"
     # Headers prepared
     payload: Dict[str, Any] = {
         "model": model,
@@ -877,14 +887,13 @@ def call_claude_with_web_search(api_key: str, model: str, user_content: str, max
         except Exception:
             pass
 
-        # Use ephemeral caching (no ttl_seconds; not permitted on some endpoints)
-        payload["system"] = [
-            {
-                "type": "text",
-                "text": system_text,
-                "cache_control": {"type": "ephemeral"}
-            }
-        ]
+        block = {
+            "type": "text",
+            "text": system_text,
+        }
+        if use_cache:
+            block["cache_control"] = {"type": "ephemeral"}
+        payload["system"] = [block]
     
     # Log a concise request summary (avoid logging full prompt to save tokens in logs)
     try:
@@ -1011,6 +1020,7 @@ def main() -> None:
     # Batch is ON by default. Use --no_batch to fall back to synchronous single-request mode.
     parser.add_argument("--no_batch", action="store_true", help="Disable Anthropic Message Batches API and use synchronous requests")
     parser.add_argument("--no_sidecars", action="store_true", help="Do not write raw/audit sidecar files alongside the main JSON output")
+    parser.add_argument("--no_cache", action="store_true", help="Disable Anthropic prompt caching (use for token price comparison)")
     args, unknown = parser.parse_known_args()
     # Hardcoded file paths
     prompt_path = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/data/lipstick-qa-prompt-builder.json"
@@ -1059,6 +1069,14 @@ def main() -> None:
 
     os.makedirs(output_dir, exist_ok=True)
     logger.info(f"Output directory: {output_dir}")
+    # Determine caching behavior
+    use_prompt_cache = not args.no_cache
+    logger.info("Prompt caching: %s", "ENABLED" if use_prompt_cache else "DISABLED")
+    # DIAGNOSTIC: confirm argv and parsed flags
+    try:
+        logger.info("argv=%s no_cache=%r use_prompt_cache=%r", sys.argv, args.no_cache, use_prompt_cache)
+    except Exception:
+        pass
 
     # Load configuration files
     logger.info("Loading configuration files...")
@@ -1119,6 +1137,7 @@ def main() -> None:
             output_dir=output_dir,
             logger=logger,
             no_ingest=args.no_ingest,
+            use_cache=use_prompt_cache,
         )
         session_ok += ok
         session_fail += fail
@@ -1256,6 +1275,7 @@ def main() -> None:
                 max_tokens=max_tokens,
                 debug_basepath=debug_basepath,
                 system_text=system_text,
+                use_cache=use_prompt_cache,
             )
 
             # Pre-clean: many providers wrap JSON in ```json fences; extract first JSON block if present

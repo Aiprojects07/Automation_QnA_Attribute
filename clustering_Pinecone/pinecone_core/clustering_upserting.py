@@ -207,11 +207,14 @@ def build_records_from_report(data: Dict[str, Any], source_name: str) -> Tuple[L
             a = ensure_str(qa.get("a")).strip()
             why = ensure_str(qa.get("why")).strip()
             sol = ensure_str(qa.get("solution")).strip()
+            # New: include per-QA confidence score/text when present
+            conf = ensure_str(qa.get("CONFIDENCE") or qa.get("confidence")).strip()
             qa_block = [
                 f"Q{q_idx+1}: {q}" if q else "",
                 f"A: {a}" if a else "",
                 f"WHY: {why}" if why else "",
                 f"SOLUTION: {sol}" if sol else "",
+                f"CONFIDENCE: {conf}" if conf else "",
             ]
             section_parts.append("\n".join([p for p in qa_block if p]))
 

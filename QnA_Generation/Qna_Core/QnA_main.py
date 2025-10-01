@@ -52,6 +52,9 @@ import requests
 from dotenv import load_dotenv
 import subprocess
 import hashlib
+import pandas as pd
+from io import BytesIO
+from openpyxl import load_workbook
 from anthropic import Anthropic
 from anthropic._exceptions import APIError as AnthropicAPIError
 try:
@@ -65,13 +68,14 @@ except Exception:  # SDK may not expose types; we'll fall back to plain dicts
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 DEFAULT_MODEL = "claude-opus-4-1-20250805"  # From your example
 # Default batch size for Anthropic Message Batches (change here if needed)
-BATCH_SIZE_DEFAULT = 3
+BATCH_SIZE_DEFAULT = 4
 # Default temperature for both sync and batch calls
 DEFAULT_TEMPERATURE = 0.5
 
 # Control extra artifact creation without CLI args
-WRITE_RAW_FULL: bool = False
+WRITE_RAW_FULL: bool = True
 WRITE_AUDIT_FILES: bool = False
+USE_EXCEL_DATA: bool = False
 
 # ------------------------------
 # Logging Setup
@@ -122,7 +126,37 @@ def read_prompt(path: str) -> str:
         return content
 
 
- 
+def convert_sharepoint_url(share_url: str) -> str:
+    """Convert SharePoint share URL to direct download URL.
+    Handles URLs like:
+    https://<tenant>-my.sharepoint.com/:x:/g/personal/<user>/<SHARE_TOKEN>?e=...
+    and produces:
+    https://<tenant>-my.sharepoint.com/personal/<user>/_layouts/15/download.aspx?share=<SHARE_TOKEN>
+    """
+    try:
+        # We only handle SharePoint patterns with /personal/ and an Office file marker like :x:
+        if "/personal/" in share_url and ":" in share_url:
+            from urllib.parse import urlsplit, quote as _urlquote
+            sp = urlsplit(share_url)
+            # Base domain like https://<tenant>-my.sharepoint.com
+            base = f"{sp.scheme}://{sp.netloc}"
+            # Split once at /personal/ to get user and token segment
+            _, user_and_token = share_url.split("/personal/", 1)
+            user_token_parts = user_and_token.split('/')
+            if len(user_token_parts) >= 2:
+                user_path = user_token_parts[0]
+                share_token_raw = user_token_parts[1].split('?')[0]
+                share_token = _urlquote(share_token_raw, safe='')
+                download_url = f"{base}/personal/{user_path}/_layouts/15/download.aspx?share={share_token}"
+                return download_url
+
+        # OneDrive short links often require auth/redirect; return as-is
+        if '1drv.ms' in share_url or 'onedrive.live.com' in share_url:
+            return share_url
+    except Exception:
+        pass
+
+    return share_url
 
 
 def extract_first_json_object(text: str) -> str | None:
@@ -170,42 +204,53 @@ def extract_first_json_object(text: str) -> str | None:
 def normalize_row(raw: Dict[str, str]) -> Dict[str, str]:
     # Normalize headers and values
     m = { (k or "").strip().lower().replace(" ", "_").replace(",", ""): (v or "").strip() for k, v in raw.items() }
+    
+    # Handle both Excel and CSV column mappings
     brand = m.get("brand") or m.get("company")
+    
+    # Product name mapping: Excel uses "lipstick_name", CSV uses "product_name"
     product_name = (
         m.get("product_name")
+        or m.get("lipstick_name")  # Excel column
         or m.get("product")
         or m.get("product_title")
         or m.get("line")
         or m.get("product_line")
     )
+    
     shade = m.get("shade_of_lipstick") or m.get("shade") or m.get("color")
-    # Support multiple SKU header variants including new 'Kult SKU Code'
+    
+    # Support multiple SKU header variants including Excel's 'Kult SKU Code'
     sku = (
         m.get("sku")
         or m.get("sku_code")
         or m.get("product_sku")
         or m.get("item_code")
-        or m.get("kult_sku_code")
+        or m.get("kult_sku_code")  # Both Excel and CSV
         or ""
     )
+    
     # Optional category support
     category = m.get("category") or m.get("product_category") or m.get("category_name") or ""
-    # Optional sub-category (handle hyphenated and concatenated variants)
+    
+    # Sub-category mapping: Excel uses "sub_category", CSV uses "sub_category" 
     sub_category = (
         m.get("sub_category")
         or m.get("subcategory")
         or m.get("sub-category")
         or ""
     )
-    # Optional leaf level category
+    
+    # Leaf level category: Excel uses "sub_sub_category", CSV uses "sub_sub_category"
     leaf_level_category = (
         m.get("leaf_level_category")
         or m.get("leaflevelcategory")
         or m.get("leaf_level_cat")
-        or m.get("sub_sub_category")  # new column name maps to leaf-level category
+        or m.get("sub_sub_category")  # Both Excel and CSV
         or ""
     )
-    # Optional color/appearance metrics (support multiple header variants)
+    
+    # CSV-specific color/appearance metrics (not in Excel)
     l_star = m.get("l*") or m.get("l_star") or m.get("l") or ""
     a_star = m.get("a*") or m.get("a_star") or m.get("a") or ""
     b_star = m.get("b*") or m.get("b_star") or m.get("b") or ""
@@ -215,7 +260,11 @@ def normalize_row(raw: Dict[str, str]) -> Dict[str, str]:
     sG = m.get("sg") or m.get("s_g") or ""
     sB = m.get("sb") or m.get("s_b") or ""
     gloss = m.get("gloss") or ""
+    
     full_name = f"{brand} {product_name} {shade}".strip()
+    
+    s_no = m.get("s.no.") or m.get("s_no") or ""
+    
     return {
         "brand": brand,
         "product_name": product_name,
@@ -224,7 +273,7 @@ def normalize_row(raw: Dict[str, str]) -> Dict[str, str]:
         "category": category,
         "sub_category": sub_category,
         "leaf_level_category": leaf_level_category,
-        # New optional fields
+        # CSV-specific color metrics
         "l_star": l_star,
         "a_star": a_star,
         "b_star": b_star,
@@ -235,21 +284,75 @@ def normalize_row(raw: Dict[str, str]) -> Dict[str, str]:
         "sB": sB,
         "gloss": gloss,
         "full_name": full_name,
+        "s_no": s_no,
     }
 
 
-def read_rows(csv_path: str) -> List[Dict[str, str]]:
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        out: List[Dict[str, str]] = []
-        for i, r in enumerate(reader, 1):
+def read_rows(data_path: str) -> List[Dict[str, str]]:
+    """Read product data from either Excel (SharePoint URL) or CSV file based on USE_EXCEL_DATA setting."""
+    out: List[Dict[str, str]] = []
+    
+    if USE_EXCEL_DATA:
+        # Handle Excel data from SharePoint URL
+        try:
+            # Convert SharePoint share URL to direct download URL
+            logger = logging.getLogger(__name__)
+            download_url = convert_sharepoint_url(data_path)
             try:
-                out.append(normalize_row(r))
-            except Exception as e:
-                raise ValueError(f"Row {i} invalid: {e}") from e
-        if not out:
-            raise ValueError("Input CSV contained no rows")
-        return out
+                logger.info("[excel] original_url=%s", data_path)
+                logger.info("[excel] converted_download_url=%s", download_url)
+            except Exception:
+                pass
+            
+            # Download and read Excel file
+            headers = {"User-Agent": "Mozilla/5.0 (compatible; QnA-Script/1.0)"}
+            response = requests.get(download_url, headers=headers, timeout=30)
+            if not response.ok:
+                try:
+                    err_snippet = response.text[:500] if response.text else None
+                    logger.error("[excel] GET failed: status=%s url=%s body_snippet=%r", response.status_code, response.url, err_snippet)
+                except Exception:
+                    pass
+                # Fallback: some tenants use guestaccess.aspx instead of download.aspx
+                if response.status_code == 404 and 'download.aspx' in download_url:
+                    alt_url = download_url.replace('download.aspx', 'guestaccess.aspx')
+                    try:
+                        logger.info("[excel] retrying with guestaccess.aspx: %s", alt_url)
+                    except Exception:
+                        pass
+                    response = requests.get(alt_url, headers=headers, timeout=30)
+                # If still not ok, raise
+                if not response.ok:
+                    response.raise_for_status()
+            
+            # Read Excel file from memory
+            excel_data = BytesIO(response.content)
+            df = pd.read_excel(excel_data, engine='openpyxl')
+            
+            # Convert DataFrame to list of dictionaries
+            for i, (_, row) in enumerate(df.iterrows(), 1):
+                try:
+                    # Convert pandas Series to dictionary, handling NaN values
+                    row_dict = {k: (str(v) if pd.notna(v) else "") for k, v in row.items()}
+                    out.append(normalize_row(row_dict))
+                except Exception as e:
+                    raise ValueError(f"Excel row {i} invalid: {e}") from e
+                    
+        except Exception as e:
+            raise ValueError(f"Failed to read Excel data from {data_path}: {e}") from e
+    else:
+        # Handle CSV data from local file
+        with open(data_path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for i, r in enumerate(reader, 1):
+                try:
+                    out.append(normalize_row(r))
+                except Exception as e:
+                    raise ValueError(f"CSV row {i} invalid: {e}") from e
+    
+    if not out:
+        raise ValueError(f"Input data contained no rows: {data_path}")
+    return out
 
 
 def sanitize_filename(text: str) -> str:
@@ -350,7 +453,8 @@ def _build_shared_system_blocks(prompt_text: str, use_cache: bool) -> List[Dict[
                   "q": "question here",
                   "a": "answer here",
                   "why": "explanation here",
-                  "solution": "solution here (include this key even if empty)"
+                  "solution": "solution here (include this key even if empty)",
+                  "CONFIDENCE": "High/Medium/Low | Source: [Review consensus from X+ reviews/Ingredient analysis/Limited data] | Context: [specific reasoning]"
                 }
               ]
             }
@@ -441,7 +545,7 @@ def run_batch_generation(
                     {
                         "type": "web_search_20250305",
                         "name": "web_search",
-                        "max_uses": 5,
+                        "max_uses": 10,
                     }
                 ],
             }
@@ -579,6 +683,26 @@ def run_batch_generation(
                     for c in content_blocks:
                         if getattr(c, "type", None) == "text":
                             parts.append(getattr(c, "text", ""))
+                    
+                    # If enabled, write raw text response (batch mode)
+                    if WRITE_RAW_FULL:
+                        try:
+                            base_no_ext = os.path.splitext(filename)[0]
+                            raw_sidecar_path = os.path.join(output_dir, f"{base_no_ext}.raw.txt")
+                            
+                            # Extract all text content from the response
+                            all_text_parts = []
+                            for c in content_blocks:
+                                if getattr(c, "type", None) == "text":
+                                    all_text_parts.append(getattr(c, "text", ""))
+                            
+                            # Save complete raw text response
+                            raw_text = "\n".join(all_text_parts)
+                            with open(raw_sidecar_path, "w", encoding="utf-8") as f_side:
+                                f_side.write(raw_text)
+                        except Exception as _:
+                            logger.debug("Failed to write raw text dump for %s", filename)
+
                     # Use only the FINAL text block as the model's answer
                     text = (parts[-1] if parts else "").strip()
                     raw_for_parse = extract_first_json_object(text) or text
@@ -779,6 +903,7 @@ def build_user_message(prompt_text: str, product_row: Dict[str, str], use_natura
         "sG": product_row.get("sG", ""),
         "sB": product_row.get("sB", ""),
         "gloss": product_row.get("gloss", ""),
+        "s_no": product_row.get("s_no", ""),
     }
 
     # Inline REQUIRED JSON FORMAT shared by both branches
@@ -803,7 +928,8 @@ def build_user_message(prompt_text: str, product_row: Dict[str, str], use_natura
                   "q": "question here",
                   "a": "answer here",
                   "why": "explanation here",
-                  "solution": "solution here (include this key even if empty)"
+                  "solution": "solution here (include this key even if empty)",
+                  "CONFIDENCE": "High/Medium/Low | Source: [Review consensus from X+ reviews/Ingredient analysis/Limited data] | Context: [specific reasoning]"
                 }
               ]
             }
@@ -844,6 +970,7 @@ def build_user_message(prompt_text: str, product_row: Dict[str, str], use_natura
         return system_text, user_text
     else:
         raise ValueError("use_natural_generation=False is not supported. Refusing to build an alternate prompt shape.")
+
 
 
 # ------------------------------
@@ -1024,7 +1151,17 @@ def main() -> None:
     args, unknown = parser.parse_known_args()
     # Hardcoded file paths
     prompt_path = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/data/lipstick-qa-prompt-builder.json"
-    input_csv = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/data/lipstick_list.csv"
+    
+    # Data source selection based on USE_EXCEL_DATA parameter
+    if USE_EXCEL_DATA:
+        input_data_path = "https://kult20256-my.sharepoint.com/:x:/g/personal/harshit_a_kult_app/ER4mU46_r9VAu0XCFYkVzD8Be1E4BFyHPulmXQYVf0ZTtQ?e=H0FrNA"
+        logger = logging.getLogger(__name__)
+        logger.info("Using Excel data source (online): SharePoint")
+    else:
+        input_data_path = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/data/lipstick_list.csv"
+        logger = logging.getLogger(__name__)
+        logger.info("Using CSV data source (local): %s", input_data_path)
+    
     output_dir = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/output"
     model = DEFAULT_MODEL
     max_tokens = 30000
@@ -1086,8 +1223,8 @@ def main() -> None:
         
         # Always use inline shape-only REQUIRED JSON FORMAT; no external schema file
         
-        rows = read_rows(input_csv)
-        logger.info(f"Loaded {len(rows)} products from: {input_csv}")
+        rows = read_rows(input_data_path)
+        logger.info(f"Loaded {len(rows)} products from: {input_data_path}")
     except Exception as e:
         logger.error(f"Failed to load configuration files: {e}")
         sys.exit(1)

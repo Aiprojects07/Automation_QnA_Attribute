@@ -1,24 +1,33 @@
+# Environment variables
+.env
+
+# Google Cloud credentials
+*.json
+attribute_generation_upsert/data/*.json
+
 # Python cache
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
-*.pyd
-*.egg-info/
 
-# Virtual environments
+# Virtual environment
 venv/
-.env
+env/
+
+# IDE files
+.vscode/
+.idea/
 
 # OS files
 .DS_Store
 Thumbs.db
 
-# Editor settings (optional)
-# .vscode/
-# .idea/
-
 # Logs
 *.log
+
+# Temporary files
+*.tmp
+*.temp
 
 # Outputs and debug artifacts
 QnA_Generation/output/

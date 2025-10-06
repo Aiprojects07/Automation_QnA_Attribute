@@ -68,7 +68,7 @@ except Exception:  # SDK may not expose types; we'll fall back to plain dicts
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 DEFAULT_MODEL = "claude-opus-4-1-20250805"  # From your example
 # Default batch size for Anthropic Message Batches (change here if needed)
-BATCH_SIZE_DEFAULT = 4
+BATCH_SIZE_DEFAULT = 1
 # Default temperature for both sync and batch calls
 DEFAULT_TEMPERATURE = 0.5
 
@@ -110,20 +110,35 @@ def setup_logging(output_dir: str) -> logging.Logger:
 # ------------------------------
 
 def read_prompt(path: str) -> str:
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read().strip()
-        
-        # Check if it's a JSON file with a "prompt" key
-        if path.endswith('.json'):
-            try:
-                data = json.loads(content)
-                if isinstance(data, dict) and "prompt" in data:
-                    return data["prompt"]
-            except json.JSONDecodeError:
-                pass
-        
-        # Return raw content if not JSON or no "prompt" key
-        return content
+    """Read prompt from file with fallback to sample prompt file."""
+    logger = logging.getLogger(__name__)
+    
+    # Try to read the original prompt file
+    if os.path.exists(path):
+        logger.info(f"📄 Using prompt file: {path}")
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+    else:
+        # Fallback to sample prompt file
+        sample_path = path.replace('lipstick-qa-prompt-builder.json', 'sample_prompt.json')
+        if os.path.exists(sample_path):
+            logger.warning(f"📄 Original prompt file not found. Using sample prompt file: {sample_path}")
+            with open(sample_path, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+        else:
+            raise FileNotFoundError(f"Prompt file not found: {path} (and no sample fallback at {sample_path})")
+    
+    # Check if it's a JSON file with a "prompt" key
+    if path.endswith('.json') or path.endswith('sample_prompt.json'):
+        try:
+            data = json.loads(content)
+            if isinstance(data, dict) and "prompt" in data:
+                return data["prompt"]
+        except json.JSONDecodeError:
+            pass
+    
+    # Return raw content if not JSON or no "prompt" key
+    return content
 
 
 def convert_sharepoint_url(share_url: str) -> str:
@@ -529,6 +544,20 @@ def run_batch_generation(
     for i in range(0, len(rows), batch_size):
         wave = rows[i:i+batch_size]
         requests_payload: List[Any] = []
+        
+        # Debug: Log the wave contents to identify duplicates
+        logger.info(f"Processing wave {i//batch_size + 1}: {len(wave)} items")
+        for idx, row in enumerate(wave):
+            custom_id = _make_custom_id(row)
+            logger.info(f"  Wave item {idx}: custom_id={custom_id}, brand={row.get('brand')}, product={row.get('product_name')}, shade={row.get('shade_of_lipstick')}")
+        
+        # Check for duplicate custom_ids within this wave
+        custom_ids_in_wave = [_make_custom_id(row) for row in wave]
+        if len(custom_ids_in_wave) != len(set(custom_ids_in_wave)):
+            logger.error(f"DUPLICATE custom_ids detected in wave: {custom_ids_in_wave}")
+            duplicates = [x for x in custom_ids_in_wave if custom_ids_in_wave.count(x) > 1]
+            logger.error(f"Duplicate IDs: {set(duplicates)}")
+        
         for row in wave:
             # Build per-product user message (JSON product info)
             _, user_text = build_user_message(prompt_text, row, use_natural_generation=True)
@@ -906,56 +935,21 @@ def build_user_message(prompt_text: str, product_row: Dict[str, str], use_natura
         "s_no": product_row.get("s_no", ""),
     }
 
-    # Inline REQUIRED JSON FORMAT shared by both branches
-    required_format = textwrap.dedent(
-        """
-        {
-          "product": {
-            "brand": "...",
-            "product_line": "...",
-            "shade": "...",
-            "full_name": "...",
-            "sku": "...",
-            "category": "...",
-            "sub_category": "...",
-            "leaf_level_category": "..."
-          },
-          "sections": [
-            {
-              "title": "Section title here",
-              "qas": [
-                {
-                  "q": "question here",
-                  "a": "answer here",
-                  "why": "explanation here",
-                  "solution": "solution here (include this key even if empty)",
-                  "CONFIDENCE": "High/Medium/Low | Source: [Review consensus from X+ reviews/Ingredient analysis/Limited data] | Context: [specific reasoning]"
-                }
-              ]
-            }
-          ]
-        }
-        """
-    ).strip()
-
     if use_natural_generation:
-        # Build a STATIC system message (cacheable) with prompt_text and REQUIRED JSON FORMAT (inline only)
-
+        # Build a STATIC system message (cacheable) with prompt_text only
+        # The OUTPUT_FORMAT is already included in the prompt file
         system_text = textwrap.dedent(
             f"""
             {prompt_text}
 
             CRITICAL FORMATTING REQUIREMENTS:
             - Return ONLY valid JSON (no markdown, no commentary)
-            - Treat the JSON below as a SHAPE EXAMPLE (keys and nesting) only; do NOT copy the number of sections or QAs from it
+            - Follow the OUTPUT_FORMAT structure defined in the prompt
             - Do NOT include code fences (```), markdown, prose, or any text before/after the JSON
             - Follow the section and QA counts from the PROMPT'S STRUCTURE 
             - Expand arrays to meet the PROMPT requirements even if the example shows fewer items
             - Use the exact product keys shown (including "sku", "category", "sub_category", "leaf_level_category"); keys must always be present (empty string allowed if unknown)
             - Do NOT include any citations, footnotes, source markers, or attribution (e.g., <cite ...>...</cite>, [1], (ref), URLs). Present everything as expert knowledge.
-
-            REQUIRED JSON FORMAT:
-            {required_format}
             """
         ).strip()
 
@@ -1150,7 +1144,7 @@ def main() -> None:
     parser.add_argument("--no_cache", action="store_true", help="Disable Anthropic prompt caching (use for token price comparison)")
     args, unknown = parser.parse_known_args()
     # Hardcoded file paths
-    prompt_path = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/data/lipstick-qa-prompt-builder.json"
+    prompt_path = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/data/lipstick-qa-prompt-builder (3)(1).json"
     
     # Data source selection based on USE_EXCEL_DATA parameter
     if USE_EXCEL_DATA:

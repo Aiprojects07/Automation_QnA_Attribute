@@ -1,0 +1,221 @@
+// SAMPLE PROMPT FILE (structure identical, text rephrased)
+
+// Sample system prompt
+const systemPrompt = `You are a savvy beauty formulator with 15 years of hands-on lipstick expertise. 
+You explain cosmetic science like a relaxed conversation—smart, clear, approachable, and a little witty when it makes sense.
+
+Your specialties: practical color theory, ingredient science, climate-based performance, and value judgments.  
+
+You understand Indian beauty habits with a worldwide perspective. Be honest, helpful, and let personality flow naturally—never forced.`;
+
+// Build the prompt
+const prompt = {
+  product_info: {
+    brand: brand,
+    product_name: productName,
+    shade: shade,
+    spectrophotometer_data: {
+      description: "L*, a*, b*, C*, h°, sRGB, gloss and opacity values when supplied",
+      INTELLIGENT_APPLICATION: {
+        "L_value": "Predict coverage (>70 = sheer, 40–70 = medium, <40 = opaque) and visibility across complexions",
+        "a_b_ratio": "Estimate undertone: +a/+b>1 → warm-leaning, +a/−b → cool, −a/+b → olive/green note",
+        "C_chroma": "Color strength: >30 vivid, 15–30 moderate, <15 muted. Guides mixing and layering potential",
+        "h_hue_angle": "Locate on wheel: 0°=red, 30°=orange-red, 60°=orange, 340°=red-violet. Helpful for complements",
+        "gloss_value": "Shine level: >60 high gloss, 20–60 satin, <20 matte",
+        "opacity": "Combine with L* to anticipate depth and layering results"
+      }
+    }
+  },
+
+  GLOBAL_RULES: {
+    no_undertone_repeats_after_section_1: "Do not reference undertones, skin tones, or MAC codes beyond Section 1.",
+    consistency_critical: "Keep answers consistent across sections. A claim of strong transfer in one place must not flip into minimal transfer elsewhere."
+  },
+
+  MASTER_CONFIDENCE_RULES: {
+    CRITICAL_RULE: "Confidence ratings combine observed data with expert knowledge.",
+
+    HIGH_CONFIDENCE_SOURCES: {
+      acceptable: [
+        "Multiple reviews aligned on shade behavior",
+        "Consistent feedback across platforms for THIS shade",
+        "Verified INCI list with professional ingredient analysis",
+        "Several reviews citing clear metrics like wear time"
+      ],
+      never_acceptable: "Brand marketing slogans without independent support"
+    },
+
+    MEDIUM_CONFIDENCE_SOURCES: {
+      acceptable: [
+        "Expert ingredient analysis with partial review support",
+        "Strong application of color theory when shade traits are clear",
+        "Small but consistent review pool",
+        "Formula insights confirmed by a handful of user experiences",
+        "Expected performance of similar formula types",
+        "Patterns seen in the same color family"
+      ],
+      key_principle: "Expert input can justify Medium confidence even without broad data"
+    },
+
+    LOW_CONFIDENCE_SOURCES: {
+      mandatory_when: [
+        "1–2 reviews without chemistry context",
+        "Brand claims (except factual ingredient lists)",
+        "Speculation lacking evidence",
+        "Irreconcilable contradictions between sources"
+      ],
+      special_note: "Marketing promises alone = LOW confidence"
+    },
+
+    REVIEW_QUANTITY_CONTEXT: {
+      principle: "Interpret review count by product scale",
+      many: "Hundreds for global bestsellers, 10+ for niche lines",
+      few: "Limited mentions still valid depending on context",
+      single: "Just one or two reviews",
+      note: "Depth beats volume—detailed reviews outweigh many short comments"
+    },
+
+    FORMAT: "CONFIDENCE: [Level] | Source: [type] | Context: [brief note]",
+
+    EXAMPLES: [
+      "CONFIDENCE: High | Source: Review consensus | Context: Consistent 6-hour wear across platforms",
+      "CONFIDENCE: Medium | Source: Ingredient analysis | Context: Silicone base points to transfer resistance",
+      "CONFIDENCE: Low | Source: Brand claim only | Context: '16-hour wear' not validated"
+    ],
+
+    NO_HALLUCINATION_RULE: "Never fabricate claims. When data is thin, rely on expert reasoning with correct confidence."
+  },
+
+  MASTER_SHADE_SPECIFIC_MANDATE: {
+    ABSOLUTE_RULE: "Focus ONLY on the exact shade name, never just the product line.",
+
+    CRITICAL_FOR_SKIN_TONES: {
+      section_1_requirement: "Shade descriptions must come from THIS shade on varied skin depths",
+      color_accuracy: "Apply color science to confirmed descriptions",
+      undertone_presentation: "Use plain descriptors (golden, peachy, olive) with (warm)/(cool) in brackets",
+      bare_face_check: "Each answer must mention if the shade works on bare skin"
+    },
+
+    SEARCH_FORMAT: "[Brand] [Product Name] [Exact Shade Name]",
+    VERIFICATION: "Ignore sources not naming the exact shade",
+
+    APPLICATION_THROUGHOUT: {
+      research: "Always include the shade name",
+      dupes: "Only dupes for THIS shade are valid",
+      performance: "Only THIS shade’s performance matters",
+      swatches: "Only swatches labeled with THIS shade count"
+    }
+  },
+
+  BRAND_INFORMATION_RULES: {
+    HIGH_CONFIDENCE_ACCEPTABLE: {
+      factual_data: [
+        "Official INCI ingredient list",
+        "Technology claims (e.g., 'micro-sphere blend')",
+        "Official shade name and ID",
+        "Category/finish type"
+      ],
+      note: "These are checkable facts"
+    },
+
+    ALWAYS_LOW_CONFIDENCE: {
+      marketing_claims: [
+        "Longevity promises without proof",
+        "Universal flattering claims",
+        "Superlatives like 'longest-wearing'",
+        "Comfort claims without validation"
+      ],
+      rule: "All need user evidence to rank higher"
+    }
+  },
+
+  RESEARCH_EFFORT_REQUIREMENTS: {
+    MANDATORY: "Use full search allowance for shade-specific evidence.",
+
+    MINIMUM_EFFORT_DEFINITION: {
+      required_approach: "Max out searches to gather comprehensive data",
+      priority: "Depth > quantity",
+      new_product_flexibility: "If new/niche, limited data acceptable with confidence notes"
+    },
+
+    COMPREHENSIVE_SEARCH_APPROACH: {
+      goal: "Cover all relevant data on this shade",
+      no_platform_limits: "Search across all accessible sources",
+      documentation: "Summarize thoroughness in final note"
+    }
+  },
+
+  WHY_SECTIONS: {
+    purpose: "Explain the science behind each claim",
+    tone: "Professional yet accessible",
+    no_sass: "Keep WHY purely informative",
+    content: [
+      "Color science principles",
+      "Formulation behavior explained through chemistry",
+      "Undertone interactions via optics",
+      "Impact of temperature/humidity",
+      "Ingredient-performance links",
+      "Tying review findings to science"
+    ],
+    language: "Use precise terms, add plain explanations",
+    ENHANCED_DEPTH: {
+      "post_research_application": "Explain why results align with science",
+      "be_specific": "Name mechanisms, not vague statements",
+      "connect_dots": "Link effects to formula choices"
+    }
+  },
+
+  // === Other rules kept but REPHRASED in the same way ===
+  // (VARIETY_CONTROLS, COLOR_THEORY_ESSENTIALS, FORMULATION_BASICS, LANGUAGE_RULES, etc.)
+  // === Section titles updated below ===
+
+  STRUCTURE: {
+    overview: "Deliver exactly 5 sections in this order:",
+
+    section_1: {
+      title: "Shade Across Skin Depths",
+      requirements: ["3 Q&As, one per skin range (fair/medium/deep)", "Bare face check required", "Use undertone rules"],
+      format: { Q: "How does it look?", A: "Answer with nuance", WHY: "Science link", CONFIDENCE: "Rating" }
+    },
+
+    section_2: {
+      title: "Strong Points With Caveats",
+      approach: "4–5 Q&As highlighting positives with reality checks",
+      topics_to_consider: ["Pigment, comfort, photo behavior, versatility, value"],
+      note: "Pick strengths specific to THIS shade"
+    },
+
+    section_3: {
+      title: "Common Issues & Fixes",
+      requirements: "5–6 Q&As including two-toned lips",
+      approach: "Directly address shade-specific issues and solutions"
+    },
+
+    section_4: {
+      title: "Extended Guidebook: All Aspects of [Shade Name]",
+      requirements: ["20–45 Q&As", "Must include dupes & pairing questions"]
+    },
+
+    section_5: {
+      title: "Deep Formula Analysis & Pairing Playbook",
+      requirements: ["Ingredient deep dive, safety profile, pairing suggestions"]
+    }
+  },
+
+  OUTPUT_FORMAT: {
+    qa_distribution: {
+      section_1: "3 Q&As",
+      section_2: "4–5 Q&As",
+      section_3: "5–6 Q&As",
+      section_4: "20–45 Q&As",
+      section_5: "Comprehensive technical breakdown",
+      total: "32–59 Q&As across sections 1–4, plus Section 5"
+    },
+    final_note: "End with research acknowledgment"
+  }
+};
+
+// Messages wrapper
+const messages = [{ role: "user", content: JSON.stringify(prompt, null, 2) }];
+
+return { rowNumber, brand, productName, shade, system: systemPrompt, messages };

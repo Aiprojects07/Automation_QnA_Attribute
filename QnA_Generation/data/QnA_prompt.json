@@ -15,7 +15,13 @@ Output format:
 
 Requirements:
 • Use canonical attribute names (e.g., "finish", "undertone", "longevity", "transfer", "fragrance").
-• Each value must be a single word or concise scalar (e.g., "matte", "peachy-pink", "long").
-• Add confidence = high only when the Q&A states it explicitly; otherwise drop to medium/low.
+• Each value must be a single word or concise scalar (e.g., "matte", "peachy-pink", "16").
+• If an attribute has a numeric value with a unit, represent it as {"value": <number>, "unit": "<unit>"}.
+• Booleans must be true/false (not "yes"/"no").
+• Add confidence = "high" only when the Q&A states it explicitly; otherwise use "medium" or "low".
 • Evidence must be copied verbatim from the input and trace back to the specific Q&A sentence.
 • Omit redundant or unsupported attributes.
+• Omit attributes if unknown (do not output "unknown" or null).
+
+Return ONLY a single JSON object in the above shape. 
+Do not include any text, explanation, or formatting other than the JSON.

@@ -1144,7 +1144,7 @@ def main() -> None:
     parser.add_argument("--no_cache", action="store_true", help="Disable Anthropic prompt caching (use for token price comparison)")
     args, unknown = parser.parse_known_args()
     # Hardcoded file paths
-    prompt_path = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/data/lipstick-qa-prompt-builder (3)(1).json"
+    prompt_path = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/data/lipstick-qa-prompt-revised.json"
     
     # Data source selection based on USE_EXCEL_DATA parameter
     if USE_EXCEL_DATA:

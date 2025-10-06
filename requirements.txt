@@ -6,3 +6,6 @@ python-dotenv
 requests
 pandas>=2.0.0
 openpyxl>=3.0.0
+msal
+gspread>=5.0.0
+google-auth>=2.0.0 

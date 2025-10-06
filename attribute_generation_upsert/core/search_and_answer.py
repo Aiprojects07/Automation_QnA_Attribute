@@ -1,11 +1,12 @@
 """
-Search and Answer core utilities
+Search and Answer core utilities with Excel integration
 
 This module centralizes configuration and helpers for:
 - Anthropic client (Claude Sonnet 4)
 - Prompt file path (path only; no prompt content here)
 - Pinecone index name
 - OpenAI embeddings for query vectorization
+- Excel integration for SharePoint URLs and attribute extraction
 
 Environment variables used:
 - ANTHROPIC_API_KEY
@@ -24,7 +25,11 @@ import textwrap
 import csv
 import re
 import pprint
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Dict, Any
+from urllib.parse import urlsplit, quote as _urlquote
+from io import BytesIO
+import requests
+import pandas as pd
 
 try:
     # Optional: if python-dotenv is installed and a .env exists, load it.
@@ -33,6 +38,14 @@ try:
     load_dotenv()
 except Exception:
     pass
+
+try:
+    # Optional: Google Sheets integration
+    import gspread
+    from google.oauth2.service_account import Credentials
+    GSPREAD_AVAILABLE = True
+except ImportError:
+    GSPREAD_AVAILABLE = False
 
 # --- Anthropic (Claude) ---
 from anthropic import Anthropic
@@ -52,7 +65,7 @@ PROMPT_PATH: str = \
     "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/data/QnA_prompt.json"
 
 # Pinecone index name (env override supported)
-PINECONE_INDEX_NAME: str = os.getenv("PINECONE_INDEX_NAME", "qna-attributes")
+PINECONE_INDEX_NAME: str = os.getenv("PINECONE_INDEX_NAME", "lipstick-cluster")
 # Pinecone namespace (env override supported)
 PINECONE_NAMESPACE: str = os.getenv("PINECONE_NAMESPACE", "default")
 
@@ -62,6 +75,13 @@ DEFAULT_TOP_K: int = 5
 # CLI-independent defaults
 DEFAULT_CSV_PATH: str = \
     "/home/sid/Documents/Automation_QnA_Attribute/attribute_generation_upsert/core/lipstick_list.csv"
+# Google Sheets configuration
+GOOGLE_SHEETS_CREDENTIALS_PATH: str = os.getenv("GOOGLE_SHEETS_CREDENTIALS_PATH", "")
+GOOGLE_SHEETS_NAME: str = os.getenv("GOOGLE_SHEETS_NAME", "Lipstick Attributes")
+GOOGLE_SHEETS_WORKSHEET: str = os.getenv("GOOGLE_SHEETS_WORKSHEET", "Sheet1")
+
+# Processing configuration
+FORCE_REPROCESS: bool = False
 DEFAULT_MAX_TOKENS: int = 15000
 DEFAULT_TEMPERATURE: float = 0.2
 
@@ -77,6 +97,183 @@ def get_openai_client(api_key: Optional[str] = None) -> OpenAI:
     if api_key:
         return OpenAI(api_key=api_key)
     return OpenAI()
+
+
+def convert_sharepoint_url(share_url: str) -> str:
+    """Convert SharePoint share URL to direct download URL.
+    Handles URLs like:
+    https://<tenant>-my.sharepoint.com/:x:/g/personal/<user>/<SHARE_TOKEN>?e=...
+    and produces:
+    https://<tenant>-my.sharepoint.com/personal/<user>/_layouts/15/download.aspx?share=<SHARE_TOKEN>
+    """
+    try:
+        # We only handle SharePoint patterns with /personal/ and an Office file marker like :x:
+        if "/personal/" in share_url and ":" in share_url:
+            sp = urlsplit(share_url)
+            # Base domain like https://<tenant>-my.sharepoint.com
+            base = f"{sp.scheme}://{sp.netloc}"
+            # Split once at /personal/ to get user and token segment
+            _, user_and_token = share_url.split("/personal/", 1)
+            user_token_parts = user_and_token.split('/')
+            if len(user_token_parts) >= 2:
+                user_path = user_token_parts[0]
+                share_token_raw = user_token_parts[1].split('?')[0]
+                share_token = _urlquote(share_token_raw, safe='')
+                download_url = f"{base}/personal/{user_path}/_layouts/15/download.aspx?share={share_token}"
+                return download_url
+
+        # OneDrive short links often require auth/redirect; return as-is
+        if '1drv.ms' in share_url or 'onedrive.live.com' in share_url:
+            return share_url
+    except Exception:
+        pass
+
+    return share_url
+
+
+def read_excel_from_url(excel_url: str) -> pd.DataFrame:
+    """Read Excel file from SharePoint URL and return as DataFrame."""
+    download_url = convert_sharepoint_url(excel_url)
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; AttributeExtractor/1.0)"}
+    
+    response = requests.get(download_url, headers=headers, timeout=30)
+    if not response.ok:
+        if response.status_code == 404 and 'download.aspx' in download_url:
+            alt_url = download_url.replace('download.aspx', 'guestaccess.aspx')
+            response = requests.get(alt_url, headers=headers, timeout=30)
+        if not response.ok:
+            response.raise_for_status()
+    
+    excel_data = BytesIO(response.content)
+    df = pd.read_excel(excel_data, engine='openpyxl')
+    return df
+
+
+def save_excel_to_url(df: pd.DataFrame, excel_url: str) -> None:
+    """Save DataFrame back to Excel file. Note: This requires write access to SharePoint."""
+    # For SharePoint, we'll save locally and provide instructions
+    # Direct SharePoint write requires more complex authentication
+    local_path = "/tmp/updated_attributes.xlsx"
+    df.to_excel(local_path, index=False, engine='openpyxl')
+    print(f"Excel file saved locally to: {local_path}")
+    print("Please upload this file back to SharePoint manually or set up SharePoint write access.")
+
+
+def save_to_excel_file(df: pd.DataFrame, output_path: str = None) -> str:
+    """Save DataFrame to local Excel file."""
+    if output_path is None:
+        output_path = "/home/sid/Documents/Automation_QnA_Attribute/attribute_generation_upsert/output/attributes_output.xlsx"
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    
+    # Save to Excel
+    df.to_excel(output_path, index=False, engine='openpyxl')
+    return output_path
+
+
+
+
+def read_google_sheets(credentials_path: str = None, sheet_name: str = None, worksheet: str = None) -> pd.DataFrame:
+    """Read data from Google Sheets and return as DataFrame."""
+    if not GSPREAD_AVAILABLE:
+        raise ImportError("gspread and google-auth packages are required for Google Sheets integration")
+    
+    creds_path = credentials_path or GOOGLE_SHEETS_CREDENTIALS_PATH
+    sheet_name = sheet_name or GOOGLE_SHEETS_NAME
+    worksheet_name = worksheet or GOOGLE_SHEETS_WORKSHEET
+    
+    if not creds_path or not os.path.exists(creds_path):
+        raise FileNotFoundError(f"Google Sheets credentials file not found: {creds_path}")
+    
+    # Authenticate and open sheet
+    gc = gspread.service_account(filename=creds_path)
+    sheet = gc.open(sheet_name).worksheet(worksheet_name)
+    
+    # Get all records as list of dictionaries
+    records = sheet.get_all_records()
+    
+    # Convert to DataFrame
+    df = pd.DataFrame(records)
+    return df
+
+
+def save_to_google_sheets(df: pd.DataFrame, credentials_path: str = None, sheet_name: str = None, worksheet: str = None) -> bool:
+    """Save DataFrame to Google Sheets."""
+    if not GSPREAD_AVAILABLE:
+        print("⚠️  Google Sheets packages not available. Install with: pip install gspread google-auth")
+        return False
+    
+    try:
+        creds_path = credentials_path or GOOGLE_SHEETS_CREDENTIALS_PATH
+        sheet_name = sheet_name or GOOGLE_SHEETS_NAME
+        worksheet_name = worksheet or GOOGLE_SHEETS_WORKSHEET
+        
+        if not creds_path or not os.path.exists(creds_path):
+            print(f"⚠️  Google Sheets credentials file not found: {creds_path}")
+            print("📝 To set up Google Sheets integration:")
+            print("   1. Go to Google Cloud Console")
+            print("   2. Create service account and download JSON key")
+            print("   3. Share your Google Sheet with the service account email")
+            print("   4. Set GOOGLE_SHEETS_CREDENTIALS_PATH environment variable")
+            return False
+        
+        # Authenticate and open sheet
+        gc = gspread.service_account(filename=creds_path)
+        sheet = gc.open(sheet_name).worksheet(worksheet_name)
+        
+        # Clear existing data and update with new data
+        sheet.clear()
+        
+        # Convert DataFrame to list of lists (including headers)
+        data = [df.columns.tolist()] + df.values.tolist()
+        
+        # Update sheet with all data
+        sheet.update('A1', data)
+        
+        print(f"✅ Google Sheets updated successfully: {sheet_name} → {worksheet_name}")
+        print(f"📊 Uploaded {len(df)} rows with {len(df.columns)} columns")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Failed to update Google Sheets: {e}")
+        return False
+
+
+def extract_json_from_response(response_text: str) -> Dict[str, Any]:
+    """Extract JSON object from Claude's response text."""
+    response_text = response_text.strip()
+    
+    # Remove code fences if present
+    if response_text.startswith("```"):
+        response_text = response_text.strip("`")
+        if response_text.lower().startswith("json"):
+            response_text = response_text[4:].strip()
+    
+    # Find JSON object
+    start = response_text.find('{')
+    if start == -1:
+        return {}
+    
+    # Find matching closing brace
+    depth = 0
+    for i in range(start, len(response_text)):
+        if response_text[i] == '{':
+            depth += 1
+        elif response_text[i] == '}':
+            depth -= 1
+            if depth == 0:
+                json_str = response_text[start:i+1]
+                try:
+                    return json.loads(json_str)
+                except json.JSONDecodeError:
+                    continue
+    
+    # Fallback: try to parse the entire response
+    try:
+        return json.loads(response_text)
+    except json.JSONDecodeError:
+        return {}
 
 
 def embed_query(text: str, model: Optional[str] = None) -> List[float]:
@@ -352,88 +549,226 @@ def answer_with_filters(
     )
 
 
-def _cli_main(argv: Optional[Sequence[str]] = None) -> int:
+def process_csv_to_excel_attributes(csv_path: str = DEFAULT_CSV_PATH, output_excel: str = None, force_reprocess: bool = None) -> int:
+    """Read products from CSV, extract attributes using LLM, and save complete output to Excel with checkpointing.
+    
+    Parameters:
+    - csv_path: Path to input CSV file
+    - output_excel: Path to output Excel file
+    - force_reprocess: If True, reprocess all products regardless of existing attributes
+    """
     import sys
-    # Use module-level defaults instead of CLI args
-    csv_path = DEFAULT_CSV_PATH
+    
+    # Use global FORCE_REPROCESS if not explicitly provided
+    if force_reprocess is None:
+        force_reprocess = FORCE_REPROCESS
+    
+    # Determine output Excel path
+    if output_excel is None:
+        output_excel = "/home/sid/Documents/Automation_QnA_Attribute/attribute_generation_upsert/output/attributes_output.xlsx"
+    
+    print(f"📊 Reading CSV file from: {csv_path}")
+    try:
+        csv_df = pd.read_csv(csv_path)
+        print(f"✅ Loaded {len(csv_df)} products from CSV")
+    except Exception as e:
+        print(f"❌ Failed to read CSV file: {e}", file=sys.stderr)
+        return 2
+    
+    if csv_df.empty:
+        print("❌ CSV file contains no data", file=sys.stderr)
+        return 2
+    
+    # Force reprocess mode
+    if force_reprocess:
+        print("🔄 Force reprocess mode enabled - will reprocess all products")
+        df = csv_df.copy()
+        if 'attributes_json' not in df.columns:
+            df['attributes_json'] = ''
+        existing_df = None
+    else:
+        # Check if existing Excel file exists and load it for checkpointing
+        existing_df = None
+        if os.path.exists(output_excel):
+            try:
+                existing_df = pd.read_excel(output_excel, engine='openpyxl')
+                print(f"📋 Found existing Excel file with {len(existing_df)} rows")
+                
+                # Merge existing processed data with new CSV data
+                # Use a unique identifier to match rows (prefer SKU, fallback to index)
+                merge_key = None
+                for key_col in ['kult_sku_code', 'sku', 'Kult SKU Code', 'SKU']:
+                    if key_col in csv_df.columns and key_col in existing_df.columns:
+                        merge_key = key_col
+                        break
+                
+                if merge_key:
+                    print(f"🔗 Merging data using key column: {merge_key}")
+                    # Merge on the key column, keeping existing attributes_json where available
+                    df = csv_df.merge(existing_df[['attributes_json', merge_key]], 
+                                    on=merge_key, how='left', suffixes=('', '_existing'))
+                    # Use existing attributes_json if available, otherwise empty string
+                    df['attributes_json'] = df['attributes_json'].fillna('')
+                else:
+                    print("⚠️  No common key column found, using position-based merge")
+                    # Fallback: merge by position (less reliable but better than nothing)
+                    df = csv_df.copy()
+                    if 'attributes_json' in existing_df.columns and len(existing_df) > 0:
+                        # Copy existing attributes_json values by position
+                        for i in range(min(len(df), len(existing_df))):
+                            if pd.notna(existing_df.iloc[i]['attributes_json']) and str(existing_df.iloc[i]['attributes_json']).strip():
+                                df.at[i, 'attributes_json'] = existing_df.iloc[i]['attributes_json']
+                    
+                    # Add attributes_json column if it doesn't exist
+                    if 'attributes_json' not in df.columns:
+                        df['attributes_json'] = ''
+            except Exception as e:
+                print(f"⚠️  Failed to load existing Excel file: {e}")
+                print("📊 Starting fresh processing")
+                df = csv_df.copy()
+                if 'attributes_json' not in df.columns:
+                    df['attributes_json'] = ''
+        else:
+            print("📊 No existing Excel file found, starting fresh")
+            df = csv_df.copy()
+            # Add attributes_json column if it doesn't exist
+            if 'attributes_json' not in df.columns:
+                df['attributes_json'] = ''
+                print("➕ Added 'attributes_json' column")
+    
+    # Process each product
     namespace = PINECONE_NAMESPACE
     max_tokens = DEFAULT_MAX_TOKENS
     temperature = DEFAULT_TEMPERATURE
-
-    # Load product details from CSV
+    
+    processed_count = 0
+    error_count = 0
+    
+    for idx, row in df.iterrows():
+        try:
+            # Skip if already processed (has attributes_json) unless force_reprocess is True
+            if not force_reprocess and pd.notna(row.get('attributes_json')) and str(row.get('attributes_json')).strip():
+                print(f"⏭️  Skipping row {idx+1}: Already has attributes")
+                continue
+            elif force_reprocess and pd.notna(row.get('attributes_json')) and str(row.get('attributes_json')).strip():
+                print(f"🔄 Force reprocessing row {idx+1}: Overriding existing attributes")
+            
+            # Normalize column names
+            norm_row = {re.sub(r"[^a-z0-9]+", "_", str(k).lower()).strip("_"): str(v).strip() if pd.notna(v) else "" for k, v in row.items()}
+            
+            # Extract product information
+            sku = norm_row.get("kult_sku_code") or norm_row.get("sku") or ""
+            brand = norm_row.get("brand") or ""
+            product_line = (
+                norm_row.get("product_name") or 
+                norm_row.get("product") or 
+                norm_row.get("product_title") or 
+                norm_row.get("line") or ""
+            )
+            shade = (
+                norm_row.get("shade") or 
+                norm_row.get("shade_of_lipstick") or 
+                norm_row.get("color") or ""
+            )
+            category = norm_row.get("category") or ""
+            
+            # Build product name for search
+            product_name = f"{brand} {product_line} {shade}".strip()
+            
+            print(f"🔍 Processing {idx+1}/{len(df)}: {product_name}")
+            
+            # Build metadata filter
+            meta = build_metadata_filter(
+                sku=sku or None,
+                category=category or None,
+            )
+            
+            # Search for contexts
+            contexts = search_contexts(
+                query=product_name,
+                namespace=namespace,
+                metadata_filter=meta or None,
+            )
+            
+            if not contexts:
+                print(f"⚠️  No contexts found for: {product_name}")
+                df.at[idx, 'attributes_json'] = json.dumps({"error": "no_contexts_found"})
+                error_count += 1
+                continue
+            
+            # Generate answer with Claude
+            answer = generate_answer_with_claude(
+                query=product_name,
+                contexts=contexts,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            
+            # Extract JSON attributes from response
+            attributes = extract_json_from_response(answer)
+            
+            if attributes:
+                # Convert to compact JSON string for Excel cell
+                attributes_json = json.dumps(attributes, separators=(',', ':'), ensure_ascii=False)
+                df.at[idx, 'attributes_json'] = attributes_json
+                print(f"✅ Extracted attributes: {len(attributes)} keys")
+                processed_count += 1
+            else:
+                print(f"⚠️  No valid JSON extracted from response")
+                df.at[idx, 'attributes_json'] = json.dumps({"error": "invalid_json_response"})
+                error_count += 1
+                
+        except Exception as e:
+            print(f"❌ Error processing row {idx+1}: {e}")
+            df.at[idx, 'attributes_json'] = json.dumps({"error": str(e)})
+            error_count += 1
+    
+    # Save complete output to local Excel and Google Sheets
+    local_success = False
+    google_sheets_success = False
+    output_path = "failed"
+    
     try:
-        with open(csv_path, newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            rows = list(reader)
+        output_path = save_to_excel_file(df, output_excel)
+        print(f"💾 Local Excel saved: {output_path}")
+        local_success = True
     except Exception as e:
-        print(f"[error] Failed to read CSV at {csv_path}: {e}", file=sys.stderr)
-        return 2
-
-    if not rows:
-        print("[error] CSV contains no rows", file=sys.stderr)
-        return 2
-
-    # Select the first row automatically (no CLI selection)
-    row = rows[0]
-
-    # Normalize headers to snake_case: lower, non-alnum -> '_', trim underscores
-    norm_row = { re.sub(r"[^a-z0-9]+", "_", (k or "").lower()).strip("_"): (v or "").strip() for k, v in row.items() }
-
-    # Map normalized fields to our canonical names
-    sku = norm_row.get("kult_sku_code") or norm_row.get("sku") or ""
-    brand = norm_row.get("brand") or ""
-    # CSV provides the line name under Product_name; treat that as product_line
-    product_line = (
-        norm_row.get("product_name")
-        or norm_row.get("product")
-        or norm_row.get("product_title")
-        or norm_row.get("line")
-        or ""
-    )
-    # Build a full canonical product_name = "Brand Product_line Shade"
-    product_name = (f"{brand} {product_line} {norm_row.get('shade') or ''}").strip()
-    shade = (
-        norm_row.get("shade")
-        or norm_row.get("shade_of_lipstick")
-        or norm_row.get("color")
-        or ""
-    )
-    category = norm_row.get("category") or norm_row.get("product_category") or norm_row.get("category_name") or ""
-    sub_category = norm_row.get("sub_category") or norm_row.get("subcategory") or norm_row.get("sub_category_name") or ""
-    leaf_level_category = (
-        norm_row.get("sub_sub_category")
-        or norm_row.get("leaf_level_category")
-        or norm_row.get("leaflevelcategory")
-        or norm_row.get("leaf_level_cat")
-        or ""
-    )
-
-    meta = build_metadata_filter(
-        sku=sku or None,
-        category=category or None,
-    )
-
-    # Query should be only the product_name (semantic search), filtering narrows scope
-    identity_query = product_name
-
-    contexts = search_contexts(
-        query=identity_query,
-        namespace=namespace,
-        metadata_filter=meta or None,
-    )
-    if not contexts:
-        print("[error] No contexts found for the given filters.", file=sys.stderr)
-        return 2
-
-    answer = generate_answer_with_claude(
-        # Query text: product name only; prompt defines extraction behavior
-        query=identity_query,
-        contexts=contexts,
-        max_tokens=max_tokens,
-        temperature=temperature,
-    )
-    print(answer)
+        print(f"⚠️  Failed to save local Excel file: {e}")
+        output_path = "failed"
+    
+    # Try Google Sheets upload if configured
+    try:
+        if GOOGLE_SHEETS_CREDENTIALS_PATH and os.path.exists(GOOGLE_SHEETS_CREDENTIALS_PATH):
+            google_sheets_success = save_to_google_sheets(df)
+        else:
+            print("ℹ️  Google Sheets not configured (run setup_google_sheets.py to enable)")
+    except Exception as e:
+        print(f"⚠️  Failed to update Google Sheets: {e}")
+    
+    # Summary
+    total_with_attributes = len([row for _, row in df.iterrows() if pd.notna(row.get('attributes_json')) and str(row.get('attributes_json')).strip() and not str(row.get('attributes_json')).strip().startswith('{"error"')])
+    
+    print(f"\n📈 Processing Summary:")
+    print(f"   ✅ Successfully processed this run: {processed_count}")
+    print(f"   ❌ Errors this run: {error_count}")
+    print(f"   📊 Total rows: {len(df)}")
+    print(f"   📋 Total with valid attributes: {total_with_attributes}")
+    print(f"   📁 Input: CSV ({csv_path})")
+    print(f"   📁 Local Output: {'✅' if local_success else '❌'} ({output_path})")
+    print(f"   📊 Google Sheets: {'✅' if google_sheets_success else '❌'} ({GOOGLE_SHEETS_NAME})")
+    print(f"   📋 Both outputs contain product details + attributes_json column")
+    
+    if existing_df is not None and not force_reprocess:
+        print(f"   🔄 Checkpoint: Loaded existing data and processed only missing attributes")
+    elif force_reprocess:
+        print(f"   🔄 Force Reprocess: All products were reprocessed regardless of existing attributes")
+    
     return 0
+
+
+def _cli_main(argv: Optional[Sequence[str]] = None) -> int:
+    """Main CLI entry point - reads from CSV, saves to Excel."""
+    return process_csv_to_excel_attributes(csv_path=DEFAULT_CSV_PATH)
 
 
 if __name__ == "__main__":

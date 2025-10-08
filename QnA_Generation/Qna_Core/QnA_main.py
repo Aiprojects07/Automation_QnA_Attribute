@@ -68,12 +68,12 @@ except Exception:  # SDK may not expose types; we'll fall back to plain dicts
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 DEFAULT_MODEL = "claude-opus-4-1-20250805"  # From your example
 # Default batch size for Anthropic Message Batches (change here if needed)
-BATCH_SIZE_DEFAULT = 1
+BATCH_SIZE_DEFAULT = 9
 # Default temperature for both sync and batch calls
-DEFAULT_TEMPERATURE = 0.5
+DEFAULT_TEMPERATURE = 1
 
 # Control extra artifact creation without CLI args
-WRITE_RAW_FULL: bool = True
+WRITE_RAW_FULL: bool = False
 WRITE_AUDIT_FILES: bool = False
 USE_EXCEL_DATA: bool = False
 
@@ -531,7 +531,8 @@ def run_batch_generation(
     """Send rows to Anthropic Message Batches in groups and process results.
     Returns (ok_count, fail_count, total_input_tokens, total_output_tokens).
     """
-    client = Anthropic(api_key=api_key)
+    # Set beta header on the client (batches reject a 'betas' body param). This enables web_search tool in batches.
+    client = Anthropic(api_key=api_key, default_headers={"anthropic-beta": "web-search-2025-03-05"})
     ok, fail = 0, 0
     total_input_tokens, total_output_tokens = 0, 0
 
@@ -574,9 +575,14 @@ def run_batch_generation(
                     {
                         "type": "web_search_20250305",
                         "name": "web_search",
-                        "max_uses": 10,
+                        "max_uses": 15,
                     }
                 ],
+                # Enable structured "thinking" with a high token budget per user specs
+                "thinking": {
+                    "type": "enabled",
+                    "budget_tokens": 31999,
+                },
             }
             custom_id = _make_custom_id(row)
 
@@ -676,6 +682,16 @@ def run_batch_generation(
                 filename = create_output_filename(row)
                 filepath = os.path.join(output_dir, filename)
 
+                # Write full raw batch item as plain text (serialized JSON) sidecar
+                try:
+                    base_no_ext = os.path.splitext(filename)[0]
+                    raw_result_txt_path = os.path.join(output_dir, f"{base_no_ext}.raw.result.txt")
+                    raw_serialized = _to_json_serializable(item)
+                    with open(raw_result_txt_path, "w", encoding="utf-8") as f_rawtxt:
+                        f_rawtxt.write(json.dumps(raw_serialized, ensure_ascii=False, indent=2))
+                except Exception as _:
+                    logger.debug("Failed to write raw result text sidecar for %s", filename)
+
                 # Cache metrics per item (best-effort: try multiple locations)
                 try:
                     cache_status = None
@@ -712,6 +728,21 @@ def run_batch_generation(
                     for c in content_blocks:
                         if getattr(c, "type", None) == "text":
                             parts.append(getattr(c, "text", ""))
+                    # Fallback: if no explicit 'text' blocks, try SDK convenience fields and log block types
+                    if not parts:
+                        try:
+                            content_types = [getattr(c, "type", type(c).__name__) for c in content_blocks]
+                            logger.warning("[batch] No 'text' blocks found. content_types=%s", content_types)
+                        except Exception:
+                            pass
+                        # Some SDK versions expose a unified text via 'output_text' or 'text'
+                        try:
+                            fallback_text = getattr(message, "output_text", None) or getattr(message, "text", None)
+                            if isinstance(fallback_text, str) and fallback_text.strip():
+                                parts = [fallback_text]
+                                logger.info("[batch] Used message.output_text/text as fallback for custom_id=%s", custom_id)
+                        except Exception:
+                            pass
                     
                     # If enabled, write raw text response (batch mode)
                     if WRITE_RAW_FULL:
@@ -724,6 +755,14 @@ def run_batch_generation(
                             for c in content_blocks:
                                 if getattr(c, "type", None) == "text":
                                     all_text_parts.append(getattr(c, "text", ""))
+                            # Also include fallback_text if no text blocks were present
+                            if not all_text_parts:
+                                try:
+                                    fb_txt = getattr(message, "output_text", None) or getattr(message, "text", None)
+                                    if isinstance(fb_txt, str) and fb_txt.strip():
+                                        all_text_parts.append(fb_txt)
+                                except Exception:
+                                    pass
                             
                             # Save complete raw text response
                             raw_text = "\n".join(all_text_parts)
@@ -795,6 +834,42 @@ def run_batch_generation(
             fail += len(wave)
 
     return ok, fail, total_input_tokens, total_output_tokens
+
+
+# --- Utility: safely convert SDK/Pydantic objects to JSON-serializable data ---
+def _to_json_serializable(obj):
+    """Best-effort conversion of SDK objects to JSON-serializable structures.
+    Keeps dicts/lists/primitives as-is, tries model_dump()/dict()/vars(), then str().
+    """
+    # Primitives
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    # List/tuple
+    if isinstance(obj, (list, tuple)):
+        return [_to_json_serializable(x) for x in obj]
+    # Dict
+    if isinstance(obj, dict):
+        return {str(k): _to_json_serializable(v) for k, v in obj.items()}
+    # Pydantic v2
+    try:
+        return _to_json_serializable(obj.model_dump())  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    # Pydantic v1
+    try:
+        return _to_json_serializable(obj.dict())  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    # Generic objects
+    try:
+        return {k: _to_json_serializable(v) for k, v in vars(obj).items()}
+    except Exception:
+        pass
+    # Fallback to string
+    try:
+        return str(obj)
+    except Exception:
+        return None
 
 
 # ------------------------------
@@ -971,7 +1046,7 @@ def build_user_message(prompt_text: str, product_row: Dict[str, str], use_natura
 # Anthropic call w/ built-in web search tool
 # ------------------------------
 
-def call_claude_with_web_search(api_key: str, model: str, user_content: str, max_tokens: int = 30000, debug_basepath: str | None = None, system_text: str | None = None, use_cache: bool = True) -> tuple[str, dict]:
+def call_claude_with_web_search(api_key: str, model: str, user_content: str, max_tokens: int = 32000, debug_basepath: str | None = None, system_text: str | None = None, use_cache: bool = True) -> tuple[str, dict]:
     """Call Claude API with retry logic and usage tracking."""
     logger = logging.getLogger(__name__)
     
@@ -1144,7 +1219,7 @@ def main() -> None:
     parser.add_argument("--no_cache", action="store_true", help="Disable Anthropic prompt caching (use for token price comparison)")
     args, unknown = parser.parse_known_args()
     # Hardcoded file paths
-    prompt_path = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/data/lipstick-qa-prompt-revised.json"
+    prompt_path = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/data/final-prompt-hf.json"
     
     # Data source selection based on USE_EXCEL_DATA parameter
     if USE_EXCEL_DATA:
@@ -1158,7 +1233,7 @@ def main() -> None:
     
     output_dir = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/output"
     model = DEFAULT_MODEL
-    max_tokens = 30000
+    max_tokens = 32000
 
     # Setup logging
     logger = setup_logging(output_dir)
@@ -1368,7 +1443,7 @@ def main() -> None:
                         with open(filepath, "w", encoding="utf-8") as out:
                             json.dump(obj, out, ensure_ascii=False, indent=2)
 
-                        # Optional debug: save parsed JSON as well
+                        # Optionally write parsed JSON as well
                         if debug_basepath:
                             try:
                                 with open(f"{debug_basepath}_parsed.json", "w", encoding="utf-8") as f_parsed:
@@ -1526,7 +1601,7 @@ def main() -> None:
                 except Exception:
                     logger.debug("Failed to write JSON error file for %s", debug_basepath)
             session_fail += 1
-            update_checkpoint(output_dir, row, False, checkpoint_data)
+            update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
             continue
         except Exception as e:
             logger.error(f"✗ Row {idx}: Unexpected error: {e}")
@@ -1537,7 +1612,7 @@ def main() -> None:
                 except Exception:
                     logger.debug("Failed to write unexpected error file for %s", debug_basepath)
             session_fail += 1
-            update_checkpoint(output_dir, row, False, checkpoint_data)
+            update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
             continue
 
     # Final statistics

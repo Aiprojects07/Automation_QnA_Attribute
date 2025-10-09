@@ -68,7 +68,7 @@ except Exception:  # SDK may not expose types; we'll fall back to plain dicts
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 DEFAULT_MODEL = "claude-opus-4-1-20250805"  # From your example
 # Default batch size for Anthropic Message Batches (change here if needed)
-BATCH_SIZE_DEFAULT = 9
+BATCH_SIZE_DEFAULT = 3
 # Default temperature for both sync and batch calls
 DEFAULT_TEMPERATURE = 1
 
@@ -644,6 +644,8 @@ def run_batch_generation(
 
             items = raw_results
             logger.info("Batch %s returned %s results", batch_id, len(items))
+            # Prepare a queue for items that require resume (to run as a SECOND BATCH)
+            resume_queue: List[Dict[str, Any]] = []
 
             # Process each result item
             for item in items:
@@ -743,6 +745,41 @@ def run_batch_generation(
                                 logger.info("[batch] Used message.output_text/text as fallback for custom_id=%s", custom_id)
                         except Exception:
                             pass
+
+                    # Resume policy:
+                    # - ALWAYS resume when stop_reason == "pause_turn" (even if partial text exists)
+                    # - ALSO resume when there are no text parts (defensive for other anomalies)
+                    try:
+                        stop_reason = getattr(message, "stop_reason", None)
+                    except Exception:
+                        stop_reason = None
+                    if stop_reason == "pause_turn":
+                        # Queue for parallel resume via a second batch
+                        try:
+                            _, user_text_resume = build_user_message(prompt_text, row, use_natural_generation=True)
+                        except Exception:
+                            user_text_resume = ""
+                        resume_queue.append({
+                            "custom_id": custom_id,
+                            "row": row,
+                            "original_user_text": user_text_resume,
+                            "combined_blocks": _clean_orphan_tool_use(_to_json_serializable(content_blocks)),
+                        })
+                        # Skip finalization for now; will be handled in resume batch
+                        continue
+                    elif not parts:
+                        # Queue for parallel resume via a second batch
+                        try:
+                            _, user_text_resume = build_user_message(prompt_text, row, use_natural_generation=True)
+                        except Exception:
+                            user_text_resume = ""
+                        resume_queue.append({
+                            "custom_id": custom_id,
+                            "row": row,
+                            "original_user_text": user_text_resume,
+                            "combined_blocks": _clean_orphan_tool_use(_to_json_serializable(content_blocks)),
+                        })
+                        continue
                     
                     # If enabled, write raw text response (batch mode)
                     if WRITE_RAW_FULL:
@@ -820,6 +857,184 @@ def run_batch_generation(
                     ok += 1
                 else:
                     fail += 1
+
+            # Process resume_queue in parallel via batch waves until all are terminal
+            while resume_queue:
+                try:
+                    logger.info("Starting resume batch for %s items", len(resume_queue))
+                except Exception:
+                    pass
+                resume_requests: List[Any] = []
+                # Build resume requests
+                for r in resume_queue:
+                    custom_id_r = r["custom_id"]
+                    row_r = r["row"]
+                    original_user_text_r = r.get("original_user_text", "")
+                    combined_blocks_r = r.get("combined_blocks", [])
+                    # Extra safety: sanitize combined blocks before sending
+                    combined_blocks_r = _clean_orphan_tool_use(combined_blocks_r)
+                    messages_r = [
+                        {"role": "user", "content": original_user_text_r},
+                        {"role": "assistant", "content": combined_blocks_r},
+                        {"role": "user", "content": "Please continue and return ONLY the final JSON now. Use the existing search results above"},
+                    ]
+                    params_r = {
+                        "model": model,
+                        "max_tokens": max_tokens,
+                        "temperature": DEFAULT_TEMPERATURE,
+                        "system": shared_system,
+                        "messages": messages_r,
+                        "tools": [
+                            {
+                                "type": "web_search_20250305",
+                                "name": "web_search",
+                                "max_uses": 15,
+                            }
+                        ],
+                        "thinking": {
+                            "type": "enabled",
+                            "budget_tokens": 31999,
+                        },
+                    }
+                    if MessageCreateParamsNonStreaming and BatchRequest:
+                        resume_requests.append(
+                            BatchRequest(
+                                custom_id=custom_id_r,
+                                params=MessageCreateParamsNonStreaming(**params_r)
+                            )
+                        )
+                    else:
+                        resume_requests.append({"custom_id": custom_id_r, "params": params_r})
+
+                # Submit resume batch
+                try:
+                    resume_batch = client.messages.batches.create(requests=resume_requests)
+                    resume_batch_id = getattr(resume_batch, "id", None) or resume_batch["id"]  # type: ignore
+                    logger.info("Resume batch submitted: id=%s", resume_batch_id)
+                    # Poll
+                    while True:
+                        st = client.messages.batches.retrieve(resume_batch_id)
+                        st_status = getattr(st, "processing_status", None)
+                        logger.info("Resume batch %s status: %s", resume_batch_id, st_status)
+                        if st_status is None or st_status in ("ended", "completed", "cancelled", "expired", "failed"):
+                            break
+                        time.sleep(3)
+                    # Fetch results
+                    resume_results_iter = client.messages.batches.results(resume_batch_id)
+                    try:
+                        resume_items = list(resume_results_iter)
+                    except Exception:
+                        resume_items = getattr(resume_results_iter, "data", None) or resume_results_iter.get("data", [])  # type: ignore
+                except Exception as e_res:
+                    logger.error("Resume batch submission failed: %s", e_res)
+                    # Mark all queued items as failed in checkpoint and count as fail
+                    for r in resume_queue:
+                        update_checkpoint(output_dir, r["row"], False, load_checkpoint(output_dir))
+                        fail += 1
+                    resume_queue = []
+                    break
+
+                # Map custom_id to queue entry for quick access
+                resume_map = {r["custom_id"]: r for r in resume_queue}
+                next_round: List[Dict[str, Any]] = []
+
+                # Process each resume item
+                for item_r in resume_items:
+                    custom_id_r = getattr(item_r, "custom_id", None)
+                    result_obj_r = getattr(item_r, "result", None)
+                    if getattr(result_obj_r, "type", None) != "succeeded":
+                        # mark fail
+                        r = resume_map.get(custom_id_r)
+                        if r:
+                            update_checkpoint(output_dir, r["row"], False, load_checkpoint(output_dir))
+                            fail += 1
+                        continue
+                    message_r = getattr(result_obj_r, "message", None)
+                    content_blocks_r = getattr(message_r, "content", None) or []
+                    stop_reason_r = getattr(message_r, "stop_reason", None)
+                    # Extend prior combined blocks
+                    prior = resume_map.get(custom_id_r)
+                    if not prior:
+                        continue
+                    combined_so_far = prior.get("combined_blocks", [])
+                    combined_so_far.extend(_clean_orphan_tool_use(content_blocks_r))
+
+                    # Usage accumulation
+                    usage_r = getattr(message_r, "usage", None)
+                    try:
+                        if isinstance(usage_r, dict):
+                            in_tok = int(usage_r.get("input_tokens", 0) or 0)
+                            out_tok = int(usage_r.get("output_tokens", 0) or 0)
+                        else:
+                            in_tok = int(getattr(usage_r, "input_tokens", 0) or 0)
+                            out_tok = int(getattr(usage_r, "output_tokens", 0) or 0)
+                        total_input_tokens += in_tok
+                        total_output_tokens += out_tok
+                        logger.info("[batch][resume][usage] custom_id=%s in+=%s out+=%s", custom_id_r, in_tok, out_tok)
+                    except Exception:
+                        pass
+
+                    if stop_reason_r == "pause_turn":
+                        # Queue again with extended blocks
+                        next_round.append({
+                            "custom_id": custom_id_r,
+                            "row": prior["row"],
+                            "original_user_text": prior.get("original_user_text", ""),
+                            "combined_blocks": combined_so_far,
+                        })
+                        continue
+
+                    # Terminal: finalize -> extract text, parse, write, ingest, checkpoint
+                    r_row = prior["row"]
+                    filename = create_output_filename(r_row)
+                    filepath = os.path.join(output_dir, filename)
+
+                    # Extract and merge all text blocks
+                    resumed_parts = [b.get("text", "") for b in combined_so_far if isinstance(b, dict) and b.get("type") == "text" and b.get("text")]
+                    text_final = ("\n".join(resumed_parts)).strip() if resumed_parts else ""
+                    raw_for_parse = extract_first_json_object(text_final) or text_final
+                    try:
+                        obj = json.loads(raw_for_parse)
+                    except Exception as e_json:
+                        logger.error("Failed to parse resumed JSON for %s: %s", custom_id_r, e_json)
+                        update_checkpoint(output_dir, r_row, False, load_checkpoint(output_dir))
+                        fail += 1
+                        continue
+
+                    # Optional raw text dump
+                    if WRITE_RAW_FULL:
+                        try:
+                            base_no_ext = os.path.splitext(filename)[0]
+                            raw_sidecar_path = os.path.join(output_dir, f"{base_no_ext}.raw.txt")
+                            with open(raw_sidecar_path, "w", encoding="utf-8") as f_side:
+                                f_side.write(text_final)
+                        except Exception:
+                            logger.debug("Failed to write resume raw text for %s", filename)
+
+                    # Write output JSON
+                    try:
+                        with open(filepath, "w", encoding="utf-8") as out:
+                            json.dump(obj, out, ensure_ascii=False, indent=2)
+                    except Exception as e_write:
+                        logger.error("Failed to write output for %s: %s", filename, e_write)
+                        update_checkpoint(output_dir, r_row, False, load_checkpoint(output_dir))
+                        fail += 1
+                        continue
+
+                    # Ingest
+                    ing_ok = True
+                    if not no_ingest:
+                        ing_ok = trigger_ingestion(filepath, logger)
+                    else:
+                        logger.info("Auto-ingest disabled via --no_ingest; skipping ingestion for %s", filepath)
+                    update_checkpoint(output_dir, r_row, ing_ok, load_checkpoint(output_dir))
+                    if ing_ok:
+                        ok += 1
+                    else:
+                        fail += 1
+
+                # Prepare for next round if any still paused
+                resume_queue = next_round
 
         except AnthropicAPIError as e:
             logger.error("Batch API error: %s", e)
@@ -1202,6 +1417,169 @@ def call_claude_with_web_search(api_key: str, model: str, user_content: str, max
             except Exception:
                 logger.debug("Failed to write error debug for %s", debug_basepath)
         raise
+
+
+# ------------------------------
+# Pause-turn resume helpers (synchronous)
+# ------------------------------
+
+def _clean_orphan_tool_use(blocks: List[Any]) -> List[Dict[str, Any]]:
+    """Convert SDK blocks to plain dicts and drop a dangling server_tool_use at the end.
+    This works around rare cases where a tool_use appears without a matching result.
+    """
+    logger = logging.getLogger(__name__)
+    plain_blocks = _to_json_serializable(blocks)
+    if not isinstance(plain_blocks, list):
+        return []
+    # Ensure dict-like entries
+    cleaned: List[Dict[str, Any]] = []
+    for b in plain_blocks:
+        if isinstance(b, dict):
+            cleaned.append(b)
+        else:
+            # best-effort: wrap as text if unknown
+            cleaned.append({"type": "text", "text": str(b)})
+    # Determine which tool_use IDs have corresponding results
+    result_ids: set = set()
+    for blk in cleaned:
+        if isinstance(blk, dict) and blk.get("type") in ("web_search_tool_result", "tool_result"):
+            tuid = blk.get("tool_use_id")
+            if tuid:
+                result_ids.add(tuid)
+
+    # Drop any tool_use/server_tool_use blocks that do NOT have a matching result
+    # This prevents Anthropic InvalidRequestError during resume when a dangling tool_use is present
+    filtered: List[Dict[str, Any]] = []
+    seen_tool_use_ids: set = set()
+    dropped_orphans: List[str] = []
+    dropped_duplicates: List[str] = []
+    for blk in cleaned:
+        if isinstance(blk, dict) and blk.get("type") in ("server_tool_use", "tool_use"):
+            use_id = blk.get("id") or blk.get("tool_use_id")
+            # Skip tool_use that has no corresponding result in the provided blocks
+            if use_id and use_id not in result_ids:
+                dropped_orphans.append(str(use_id))
+                continue
+            # Also drop exact duplicates to keep history compact
+            if use_id and use_id in seen_tool_use_ids:
+                dropped_duplicates.append(str(use_id))
+                continue
+            if use_id:
+                seen_tool_use_ids.add(use_id)
+        filtered.append(blk)
+    # Guardrail logs for visibility
+    try:
+        if dropped_orphans:
+            logger.info("[resume][sanitize] Dropped dangling tool_use ids (no matching tool_result): %s", ", ".join(sorted(set(dropped_orphans))))
+        if dropped_duplicates:
+            logger.info("[resume][sanitize] Dropped duplicate tool_use ids: %s", ", ".join(sorted(set(dropped_duplicates))))
+    except Exception:
+        pass
+    return filtered
+
+
+def _resume_until_end_turn(
+    api_key: str,
+    model: str,
+    system_blocks: List[Dict[str, Any]],
+    original_user_text: str,
+    paused_assistant_blocks: List[Any],
+    max_tokens: int,
+    use_cache: bool,
+    logger: logging.Logger,
+    tools: List[Dict[str, Any]],
+    thinking: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Resume a pause_turn conversation by re-sending assistant blocks + a 'Please continue' turn.
+    Returns (combined_assistant_blocks, usage_totals).
+    """
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    # Keep beta headers consistent with batch/sync usage: include web_search beta always; add prompt-caching beta when caching is enabled
+    headers["anthropic-beta"] = (
+        "prompt-caching-2024-07-31, web-search-2025-03-05" if use_cache else "web-search-2025-03-05"
+    )
+
+    combined_blocks: List[Dict[str, Any]] = _clean_orphan_tool_use(paused_assistant_blocks)
+    usage_totals = {"input_tokens": 0, "output_tokens": 0}
+
+    attempts = 0
+    while True:
+        # History: original user -> assistant (combined so far) -> user continue
+        messages = [
+            {"role": "user", "content": original_user_text},
+            {"role": "assistant", "content": combined_blocks},
+            {"role": "user", "content": "Please continue and return ONLY the final JSON now."},
+        ]
+
+        payload: Dict[str, Any] = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "temperature": DEFAULT_TEMPERATURE,
+            # IMPORTANT: reuse the original system_blocks object to preserve exact
+            # cache_control markers and byte-for-byte identity for prompt caching
+            "system": system_blocks,
+            "messages": messages,
+            "tools": tools,
+            "thinking": thinking,
+        }
+
+        attempts += 1
+        try:
+            logger.info("[resume] attempt=%s sending continuation request (messages=%s blocks)", attempts, sum(len(m.get("content", [])) for m in messages if isinstance(m.get("content", []), list)))
+        except Exception:
+            pass
+
+        try:
+            resp = requests.post(ANTHROPIC_API_URL, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.exceptions.RequestException as e:
+            # Log details and break, returning partial combined blocks
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            body = None
+            try:
+                body = getattr(e, "response", None).text if getattr(e, "response", None) else None
+            except Exception:
+                body = None
+            logger.error(
+                "[resume] request failed: %s status=%s body_snippet=%s",
+                e, status, (body[:300] + "...") if body else None
+            )
+            break
+        except ValueError as e:
+            # JSON parsing of response failed
+            logger.error("[resume] invalid JSON in resume response: %s", e)
+            break
+
+        # Track usage
+        try:
+            usage = data.get("usage", {}) or {}
+            usage_totals["input_tokens"] += int(usage.get("input_tokens", 0) or 0)
+            usage_totals["output_tokens"] += int(usage.get("output_tokens", 0) or 0)
+            logger.info("[resume][usage] in=%s out=%s (cumulative)", usage_totals["input_tokens"], usage_totals["output_tokens"])
+        except Exception:
+            pass
+
+        # Read stop_reason and content blocks
+        stop_reason = data.get("stop_reason")
+        new_blocks = data.get("content", []) or []
+        if not isinstance(new_blocks, list):
+            new_blocks = []
+
+        # Merge into combined (preserve all prior blocks)
+        combined_blocks.extend(_clean_orphan_tool_use(new_blocks))
+
+        if stop_reason and stop_reason != "pause_turn":
+            logger.info("[resume] reached terminal stop_reason=%s", stop_reason)
+            break
+        # Continue resuming until a terminal stop_reason is reached
+        logger.info("[resume] still paused; continuing loop (attempt=%s)", attempts)
+
+    return combined_blocks, usage_totals
 
 
 # ------------------------------

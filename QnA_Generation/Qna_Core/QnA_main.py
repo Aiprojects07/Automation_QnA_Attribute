@@ -68,7 +68,7 @@ except Exception:  # SDK may not expose types; we'll fall back to plain dicts
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 DEFAULT_MODEL = "claude-opus-4-1-20250805"  # From your example
 # Default batch size for Anthropic Message Batches (change here if needed)
-BATCH_SIZE_DEFAULT = 3
+BATCH_SIZE_DEFAULT = 4
 # Default temperature for both sync and batch calls
 DEFAULT_TEMPERATURE = 1
 
@@ -76,6 +76,7 @@ DEFAULT_TEMPERATURE = 1
 WRITE_RAW_FULL: bool = False
 WRITE_AUDIT_FILES: bool = False
 USE_EXCEL_DATA: bool = False
+ENABLE_THINKING: bool = True
 
 # ------------------------------
 # Logging Setup
@@ -192,33 +193,62 @@ def extract_first_json_object(text: str) -> str | None:
     except Exception:
         pass
 
-    # Find first '{' and attempt to match a balanced object
+    # Find first '{' and attempt to match a balanced object, ignoring braces inside strings
     start = s.find('{')
     if start == -1:
         return None
 
-    # Use a simple brace counter to find the matching closing '}'
     depth = 0
+    in_string = False
+    string_char = ''
+    escaped = False
+    match_end = -1
     for i in range(start, len(s)):
         ch = s[i]
-        if ch == '{':
-            depth += 1
-        elif ch == '}':
-            depth -= 1
-            if depth == 0:
-                candidate = s[start:i+1]
-                try:
-                    json.loads(candidate)
-                    return candidate
-                except Exception:
-                    # continue scanning in case there's a later valid block
-                    pass
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == '\\':
+                escaped = True
+            elif ch == string_char:
+                in_string = False
+        else:
+            if ch in ('"', "'"):
+                in_string = True
+                string_char = ch
+            elif ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    match_end = i
+                    candidate = s[start:match_end+1]
+                    try:
+                        json.loads(candidate)
+                        return candidate
+                    except Exception:
+                        # keep scanning; there might be another valid block later
+                        pass
+
+    # Best-effort fallback for truncated outputs:
+    # Try from the first '{' to the last '}' if present
+    last_close = s.rfind('}')
+    if last_close != -1 and last_close > start:
+        candidate = s[start:last_close+1]
+        try:
+            json.loads(candidate)
+            return candidate
+        except Exception:
+            pass
+
+    # No valid object could be extracted
     return None
 
 
 def normalize_row(raw: Dict[str, str]) -> Dict[str, str]:
     # Normalize headers and values
-    m = { (k or "").strip().lower().replace(" ", "_").replace(",", ""): (v or "").strip() for k, v in raw.items() }
+    # Also strip periods to handle headers like 'S.No.'
+    m = { (k or "").strip().lower().replace(" ", "_").replace(",", "").replace(".", ""): (v or "").strip() for k, v in raw.items() }
     
     # Handle both Excel and CSV column mappings
     brand = m.get("brand") or m.get("company")
@@ -265,21 +295,20 @@ def normalize_row(raw: Dict[str, str]) -> Dict[str, str]:
         or ""
     )
     
-    # CSV-specific color/appearance metrics (not in Excel)
-    l_star = m.get("l*") or m.get("l_star") or m.get("l") or ""
-    a_star = m.get("a*") or m.get("a_star") or m.get("a") or ""
-    b_star = m.get("b*") or m.get("b_star") or m.get("b") or ""
-    c_star = m.get("c*") or m.get("c_star") or m.get("c") or m.get("chroma") or ""
-    h_deg = m.get("h°") or m.get("h_deg") or m.get("h") or ""
-    sR = m.get("sr") or m.get("s_r") or ""
-    sG = m.get("sg") or m.get("s_g") or ""
-    sB = m.get("sb") or m.get("s_b") or ""
-    gloss = m.get("gloss") or ""
-    
+    # Optional serial/s_no mapping
+    s_no = (
+        m.get("s_no")
+        or m.get("sno")
+        or m.get("s.no")
+        or m.get("serial_number")
+        or m.get("serial no")
+        or m.get("serial")
+        or m.get("serialno")
+        or ""
+    )
+
     full_name = f"{brand} {product_name} {shade}".strip()
-    
-    s_no = m.get("s.no.") or m.get("s_no") or ""
-    
+
     return {
         "brand": brand,
         "product_name": product_name,
@@ -288,16 +317,6 @@ def normalize_row(raw: Dict[str, str]) -> Dict[str, str]:
         "category": category,
         "sub_category": sub_category,
         "leaf_level_category": leaf_level_category,
-        # CSV-specific color metrics
-        "l_star": l_star,
-        "a_star": a_star,
-        "b_star": b_star,
-        "c_star": c_star,
-        "h_deg": h_deg,
-        "sR": sR,
-        "sG": sG,
-        "sB": sB,
-        "gloss": gloss,
         "full_name": full_name,
         "s_no": s_no,
     }
@@ -442,41 +461,10 @@ def _build_shared_system_blocks(prompt_text: str, use_cache: bool) -> List[Dict[
             """
             You are an expert Q&A generator for cosmetics. Follow the formatting and constraints exactly.
             Output strictly valid JSON only. No markdown.
+            Do not include any citations, tags, or URLs (e.g., <cite ...></cite>, [1], (ref), index=...). Present everything as expert knowledge.
             """
         ).strip() + "\n"
     }
-
-    # Large cached template: prompt + required JSON SHAPE (inline only)
-    required_format = textwrap.dedent(
-        """
-        {
-          "product": {
-            "brand": "...",
-            "product_line": "...",
-            "shade": "...",
-            "full_name": "...",
-            "sku": "...",
-            "category": "...",
-            "sub_category": "...",
-            "leaf_level_category": "..."
-          },
-          "sections": [
-            {
-              "title": "Section title here",
-              "qas": [
-                {
-                  "q": "question here",
-                  "a": "answer here",
-                  "why": "explanation here",
-                  "solution": "solution here (include this key even if empty)",
-                  "CONFIDENCE": "High/Medium/Low | Source: [Review consensus from X+ reviews/Ingredient analysis/Limited data] | Context: [specific reasoning]"
-                }
-              ]
-            }
-          ]
-        }
-        """
-    ).strip()
 
     big_block = {
         "type": "text",
@@ -486,15 +474,15 @@ def _build_shared_system_blocks(prompt_text: str, use_cache: bool) -> List[Dict[
 
             CRITICAL FORMATTING REQUIREMENTS:
             - Return ONLY valid JSON (no markdown, no commentary)
-            - Treat the JSON below as a SHAPE EXAMPLE (keys and nesting) only; do NOT copy the number of sections or QAs from it
             - Do NOT include code fences (```), markdown, prose, or any text before/after the JSON
             - Follow the section and QA counts from the PROMPT'S STRUCTURE 
             - Expand arrays to meet the PROMPT requirements even if the example shows fewer items
             - Use the exact product keys shown (including "sku", "category", "sub_category", "leaf_level_category"); keys must always be present (empty string allowed if unknown)
-            - Do NOT include any citations, footnotes, source markers, or attribution (e.g., <cite ...>...</cite>, [1], (ref), URLs). Present everything as expert knowledge.
-
-            REQUIRED JSON FORMAT:
-            {required_format}
+            - Do NOT include any citations, footnotes, source markers, or attribution (e.g., <cite ...></cite>, [1], (ref), URLs). Present everything as expert knowledge.
+            - Start your response with '{{' and return exactly one complete JSON object (no arrays, no multiple objects).
+            - If you have not finished generating the full JSON, do NOT return partial JSON; instead return nothing and wait for resume.
+            - Before returning, ensure the JSON contains no angle-bracket tags (e.g., <cite ...>), no 'index=' attributes, no bracketed numbers like [1] or (1), and no URLs.
+            - If any such markers appear in your draft, rewrite those lines to keep only the information and remove the markers before returning.
             """
         ).strip(),
     }
@@ -559,9 +547,53 @@ def run_batch_generation(
             duplicates = [x for x in custom_ids_in_wave if custom_ids_in_wave.count(x) > 1]
             logger.error(f"Duplicate IDs: {set(duplicates)}")
         
+        # Also skip rows that are in pending batches to avoid duplicate submissions
+        tracker = load_batch_tracker(output_dir)
+        pending_ids = set()
+        for b in tracker.get("pending_batches", []):
+            for r in b.get("rows", []):
+                cid = r.get("custom_id")
+                if cid:
+                    pending_ids.add(cid)
+
+        # Filter out rows that already have output files
+        wave_to_process = []
         for row in wave:
+            filename = create_output_filename(row)
+            filepath = os.path.join(output_dir, filename)
+            # Skip if this row's custom_id is already in a pending batch
+            cid = _make_custom_id(row)
+            if cid in pending_ids:
+                logger.info(f"[batch] custom_id already pending in another batch, skipping API call: {cid}")
+                continue
+            if os.path.exists(filepath):
+                logger.info(f"[batch] File already exists, skipping API call: {filename}")
+                # Mark as successful in checkpoint (file exists means it was processed)
+                if not no_ingest:
+                    ing_ok = trigger_ingestion(filepath, logger)
+                    update_checkpoint(output_dir, row, ing_ok, load_checkpoint(output_dir))
+                    if ing_ok:
+                        ok += 1
+                    else:
+                        fail += 1
+                        logger.warning("[batch] Marked as failed due to ingestion failure for existing file: %s", filename)
+                else:
+                    update_checkpoint(output_dir, row, True, load_checkpoint(output_dir))
+                    ok += 1
+                    logger.info("[batch] Auto-ingest disabled; marking existing file as completed: %s", filename)
+            else:
+                wave_to_process.append(row)
+        
+        # Skip this wave if all files already exist
+        if not wave_to_process:
+            logger.info(f"[batch] All files in wave {i//batch_size + 1} already exist, skipping batch submission")
+            continue
+        
+        logger.info(f"[batch] Wave {i//batch_size + 1}: {len(wave_to_process)} products need processing (skipped {len(wave) - len(wave_to_process)} existing)")
+        
+        for row in wave_to_process:
             # Build per-product user message (JSON product info)
-            _, user_text = build_user_message(prompt_text, row, use_natural_generation=True)
+            _, user_text = build_user_message(row, use_natural_generation=True)
 
             # If typed classes are available, use them; else fall back to dicts
             params = {
@@ -575,15 +607,15 @@ def run_batch_generation(
                     {
                         "type": "web_search_20250305",
                         "name": "web_search",
-                        "max_uses": 15,
+                        "max_uses": 10,
                     }
                 ],
-                # Enable structured "thinking" with a high token budget per user specs
-                "thinking": {
+            }
+            if ENABLE_THINKING:
+                params["thinking"] = {
                     "type": "enabled",
                     "budget_tokens": 31999,
-                },
-            }
+                }
             custom_id = _make_custom_id(row)
 
             if MessageCreateParamsNonStreaming and BatchRequest:
@@ -602,8 +634,14 @@ def run_batch_generation(
             batch = client.messages.batches.create(requests=requests_payload)
             batch_id = getattr(batch, "id", None) or batch["id"]  # type: ignore
             logger.info("Batch submitted: id=%s", batch_id)
+            
+            # Register this batch in tracker
+            add_pending_batch(output_dir, batch_id, i+1, i+len(wave), wave_to_process)
 
-            # Poll until completed
+            # Poll until terminal status, but cap waiting time to 45 minutes per execution pool
+            start_poll = time.time()
+            max_wait_seconds = 45 * 60  # 45 minutes
+            timed_out = False
             while True:
                 status_obj = client.messages.batches.retrieve(batch_id)
                 status = getattr(status_obj, "processing_status", None)
@@ -613,7 +651,18 @@ def run_batch_generation(
                     break
                 if status in ("ended", "completed", "cancelled", "expired", "failed"):
                     break
+                # Timeout guard: stop polling after 45 minutes
+                elapsed = time.time() - start_poll
+                if elapsed >= max_wait_seconds:
+                    logger.warning("Batch %s polling timed out after %.1f minutes; deferring results fetch to resume flow.", batch_id, elapsed / 60.0)
+                    timed_out = True
+                    break
                 time.sleep(3)
+
+            # If we timed out, skip fetching results now; they'll be picked up by resume_pending_batches
+            if timed_out:
+                logger.info("[batch] Deferring results retrieval for batch %s to resume phase; moving on to next wave.", batch_id)
+                continue
 
             # Fetch results once: materialize JSONL decoder and log per-item errors
             results_iter = client.messages.batches.results(batch_id)
@@ -720,8 +769,25 @@ def run_batch_generation(
                         )
                     else:
                         logger.info("[batch][cache] custom_id=%s status=%s", custom_id, None)
-                except Exception as _:
+                except Exception:
                     logger.debug("Failed to read cache headers for custom_id=%s", custom_id)
+
+                # Usage accumulation (initial batch item)
+                try:
+                    usage = getattr(message, "usage", None)
+                    if isinstance(usage, dict):
+                        in_tok = int(usage.get("input_tokens", 0) or 0)
+                        out_tok = int(usage.get("output_tokens", 0) or 0)
+                        cache_read_tok = int(usage.get("cache_read_input_tokens", 0) or 0)
+                    else:
+                        in_tok = int(getattr(usage, "input_tokens", 0) or 0)
+                        out_tok = int(getattr(usage, "output_tokens", 0) or 0)
+                        cache_read_tok = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+                    total_input_tokens += in_tok
+                    total_output_tokens += out_tok
+                    logger.info("[batch][usage] custom_id=%s in+=%s out+=%s cache_read_in=%s", custom_id, in_tok, out_tok, cache_read_tok)
+                except Exception:
+                    pass
 
                 # Extract text parts from non-streaming result
                 try:
@@ -756,9 +822,12 @@ def run_batch_generation(
                     if stop_reason == "pause_turn":
                         # Queue for parallel resume via a second batch
                         try:
-                            _, user_text_resume = build_user_message(prompt_text, row, use_natural_generation=True)
-                        except Exception:
-                            user_text_resume = ""
+                            _, user_text_resume = build_user_message(row, use_natural_generation=True)
+                        except Exception as e_bum:
+                            logger.error("[batch] Missing required fields for resume enqueue (%s): %s", custom_id, e_bum)
+                            update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
+                            fail += 1
+                            continue
                         resume_queue.append({
                             "custom_id": custom_id,
                             "row": row,
@@ -770,9 +839,12 @@ def run_batch_generation(
                     elif not parts:
                         # Queue for parallel resume via a second batch
                         try:
-                            _, user_text_resume = build_user_message(prompt_text, row, use_natural_generation=True)
-                        except Exception:
-                            user_text_resume = ""
+                            _, user_text_resume = build_user_message(row, use_natural_generation=True)
+                        except Exception as e_bum:
+                            logger.error("[batch] Missing required fields for resume enqueue (no-parts) (%s): %s", custom_id, e_bum)
+                            update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
+                            fail += 1
+                            continue
                         resume_queue.append({
                             "custom_id": custom_id,
                             "row": row,
@@ -858,6 +930,10 @@ def run_batch_generation(
                 else:
                     fail += 1
 
+            # Mark this batch as completed in tracker
+            mark_batch_completed(output_dir, batch_id)
+            logger.info("[batch] Batch %s marked as completed", batch_id)
+
             # Process resume_queue in parallel via batch waves until all are terminal
             while resume_queue:
                 try:
@@ -876,7 +952,7 @@ def run_batch_generation(
                     messages_r = [
                         {"role": "user", "content": original_user_text_r},
                         {"role": "assistant", "content": combined_blocks_r},
-                        {"role": "user", "content": "Please continue and return ONLY the final JSON now. Use the existing search results above"},
+                        {"role": "user", "content": "Please continue and Return ONLY the final JSON now. No preface, no markdown, no commentary. Use the existing search results above"},
                     ]
                     params_r = {
                         "model": model,
@@ -888,14 +964,15 @@ def run_batch_generation(
                             {
                                 "type": "web_search_20250305",
                                 "name": "web_search",
-                                "max_uses": 15,
+                                "max_uses": 10,
                             }
                         ],
-                        "thinking": {
+                    }
+                    if ENABLE_THINKING:
+                        params_r["thinking"] = {
                             "type": "enabled",
                             "budget_tokens": 31999,
-                        },
-                    }
+                        }
                     if MessageCreateParamsNonStreaming and BatchRequest:
                         resume_requests.append(
                             BatchRequest(
@@ -911,7 +988,7 @@ def run_batch_generation(
                     resume_batch = client.messages.batches.create(requests=resume_requests)
                     resume_batch_id = getattr(resume_batch, "id", None) or resume_batch["id"]  # type: ignore
                     logger.info("Resume batch submitted: id=%s", resume_batch_id)
-                    # Poll
+                    # Poll until terminal
                     while True:
                         st = client.messages.batches.retrieve(resume_batch_id)
                         st_status = getattr(st, "processing_status", None)
@@ -959,20 +1036,62 @@ def run_batch_generation(
                     combined_so_far = prior.get("combined_blocks", [])
                     combined_so_far.extend(_clean_orphan_tool_use(content_blocks_r))
 
+                    # Write raw resume item as plain text (serialized JSON) sidecar
+                    try:
+                        r_row = prior["row"]
+                        filename_r_side = create_output_filename(r_row)
+                        base_no_ext_r = os.path.splitext(filename_r_side)[0]
+                        raw_result_txt_path_r = os.path.join(output_dir, f"{base_no_ext_r}.raw.result.txt")
+                        raw_serialized_r = _to_json_serializable(item_r)
+                        with open(raw_result_txt_path_r, "w", encoding="utf-8") as f_rawtxt_r:
+                            f_rawtxt_r.write(json.dumps(raw_serialized_r, ensure_ascii=False, indent=2))
+                    except Exception:
+                        logger.debug("[resume] Failed to write resume raw result text sidecar for %s", custom_id_r)
+
                     # Usage accumulation
                     usage_r = getattr(message_r, "usage", None)
                     try:
                         if isinstance(usage_r, dict):
                             in_tok = int(usage_r.get("input_tokens", 0) or 0)
                             out_tok = int(usage_r.get("output_tokens", 0) or 0)
+                            cache_read_tok_r = int(usage_r.get("cache_read_input_tokens", 0) or 0)
                         else:
                             in_tok = int(getattr(usage_r, "input_tokens", 0) or 0)
                             out_tok = int(getattr(usage_r, "output_tokens", 0) or 0)
+                            cache_read_tok_r = int(getattr(usage_r, "cache_read_input_tokens", 0) or 0)
                         total_input_tokens += in_tok
                         total_output_tokens += out_tok
-                        logger.info("[batch][resume][usage] custom_id=%s in+=%s out+=%s", custom_id_r, in_tok, out_tok)
+                        logger.info("[batch][resume][usage] custom_id=%s in+=%s out+=%s cache_read_in=%s", custom_id_r, in_tok, out_tok, cache_read_tok_r)
                     except Exception:
                         pass
+
+                    # Cache metrics for resume requests (best-effort)
+                    try:
+                        cache_status_r = None
+                        cache_token_credits_r = None
+                        # Probe headers from item_r or message_r
+                        headers_r = (
+                            getattr(message_r, "response_headers", None)
+                            or getattr(message_r, "headers", None)
+                            or getattr(item_r, "response_headers", None)
+                            or getattr(item_r, "headers", None)
+                            or {}
+                        )
+                        if isinstance(headers_r, dict):
+                            cache_status_r = headers_r.get("anthropic-cache-status") or headers_r.get("x-anthropic-cache-status")
+                            cache_token_credits_r = headers_r.get("anthropic-cache-token-credits")
+                        # Also check usage object
+                        if isinstance(usage_r, dict):
+                            cache_status_r = cache_status_r or usage_r.get("anthropic-cache-status")
+                            cache_token_credits_r = cache_token_credits_r or usage_r.get("anthropic-cache-token-credits")
+                        if cache_status_r or cache_token_credits_r:
+                            logger.info(
+                                "[batch][resume][cache] custom_id=%s status=%s token_credits=%s", custom_id_r, cache_status_r, cache_token_credits_r
+                            )
+                        else:
+                            logger.info("[batch][resume][cache] custom_id=%s status=%s", custom_id_r, None)
+                    except Exception:
+                        logger.debug("Failed to read cache headers for resume custom_id=%s", custom_id_r)
 
                     if stop_reason_r == "pause_turn":
                         # Queue again with extended blocks
@@ -1038,15 +1157,15 @@ def run_batch_generation(
 
         except AnthropicAPIError as e:
             logger.error("Batch API error: %s", e)
-            # Mark all rows in this wave as failed in the checkpoint so reruns track them
-            for row in wave:
+            # Mark all rows in wave_to_process as failed in the checkpoint so reruns track them
+            for row in wave_to_process:
                 update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
-            fail += len(wave)
+            fail += len(wave_to_process)
         except Exception as e:
             logger.error("Unexpected error during batch submission/processing: %s", e)
-            for row in wave:
+            for row in wave_to_process:
                 update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
-            fail += len(wave)
+            fail += len(wave_to_process)
 
     return ok, fail, total_input_tokens, total_output_tokens
 
@@ -1201,8 +1320,505 @@ def is_product_completed(product_row: Dict[str, str], checkpoint_data: Dict[str,
     return product_id in checkpoint_data.get("completed_products", [])
 
 
-def build_user_message(prompt_text: str, product_row: Dict[str, str], use_natural_generation: bool = True) -> Tuple[str, str]:
+# ------------------------------
+# Batch Tracking System (for 15-min cutoff + resume)
+# ------------------------------
+
+def load_batch_tracker(output_dir: str) -> Dict[str, Any]:
+    """Load batch tracker data from file."""
+    tracker_file = os.path.join(output_dir, "batch_tracker.json")
+    if os.path.exists(tracker_file):
+        try:
+            with open(tracker_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Failed to load batch tracker: {e}")
+    
+    return {
+        "pending_batches": [],  # [{"batch_id": str, "submitted_at": iso_timestamp, "wave_start": int, "wave_end": int, "rows": [...]}]
+        "completed_batches": [],
+        "last_updated": None,
+    }
+
+
+def save_batch_tracker(output_dir: str, tracker_data: Dict[str, Any]) -> None:
+    """Save batch tracker data to file."""
+    tracker_file = os.path.join(output_dir, "batch_tracker.json")
+    tracker_data["last_updated"] = datetime.now().isoformat()
+    
+    try:
+        with open(tracker_file, "w", encoding="utf-8") as f:
+            json.dump(tracker_data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.getLogger(__name__).error(f"Failed to save batch tracker: {e}")
+
+
+def add_pending_batch(output_dir: str, batch_id: str, wave_start: int, wave_end: int, rows: List[Dict[str, str]]) -> None:
+    """Register a newly submitted batch as pending."""
+    tracker = load_batch_tracker(output_dir)
+    
+    # Serialize rows for resume with necessary fields
+    rows_minimal = []
+    for r in rows:
+        rows_minimal.append({
+            # Core identifiers
+            "custom_id": _make_custom_id(r),
+            "brand": r.get("brand", ""),
+            "product_name": r.get("product_name", ""),
+            "shade_of_lipstick": r.get("shade_of_lipstick", ""),
+            "sku": r.get("sku", ""),
+            # Optional product taxonomy
+            "category": r.get("category", ""),
+            "sub_category": r.get("sub_category", ""),
+            "leaf_level_category": r.get("leaf_level_category", ""),
+            # Useful deriveds
+            "full_name": r.get("full_name", ""),
+            "s_no": r.get("s_no", ""),
+        })
+    
+    tracker["pending_batches"].append({
+        "batch_id": batch_id,
+        "submitted_at": datetime.now().isoformat(),
+        "wave_start": wave_start,
+        "wave_end": wave_end,
+        "rows": rows_minimal,
+    })
+    
+    save_batch_tracker(output_dir, tracker)
+
+
+def mark_batch_completed(output_dir: str, batch_id: str) -> None:
+    """Move a batch from pending to completed."""
+    tracker = load_batch_tracker(output_dir)
+    
+    # Find and remove from pending
+    pending_batch = None
+    for i, batch in enumerate(tracker["pending_batches"]):
+        if batch["batch_id"] == batch_id:
+            pending_batch = tracker["pending_batches"].pop(i)
+            break
+    
+    if pending_batch:
+        pending_batch["completed_at"] = datetime.now().isoformat()
+        tracker["completed_batches"].append(pending_batch)
+        save_batch_tracker(output_dir, tracker)
+
+
+def resume_pending_batches(
+    api_key: str,
+    model: str,
+    prompt_text: str,
+    max_tokens: int,
+    output_dir: str,
+    logger: logging.Logger,
+    no_ingest: bool = False,
+    use_cache: bool = True,
+) -> Tuple[int, int, int, int]:
+    """Resume processing of pending batches that timed out during polling.
+    Returns (ok_count, fail_count, total_input_tokens, total_output_tokens).
+    """
+    tracker = load_batch_tracker(output_dir)
+    pending_batches = tracker.get("pending_batches", [])
+    
+    if not pending_batches:
+        logger.info("[resume] No pending batches found")
+        return 0, 0, 0, 0
+    
+    logger.info("[resume] Found %s pending batches to process", len(pending_batches))
+    
+    client = Anthropic(api_key=api_key, default_headers={"anthropic-beta": "web-search-2025-03-05"})
+    shared_system = _build_shared_system_blocks(prompt_text, use_cache)
+    
+    ok, fail = 0, 0
+    total_input_tokens, total_output_tokens = 0, 0
+    
+    for batch_info in pending_batches:
+        batch_id = batch_info["batch_id"]
+        rows_minimal = batch_info.get("rows", [])
+        
+        logger.info("[resume] Processing batch %s (%s products)", batch_id, len(rows_minimal))
+        
+        try:
+            # Check final status
+            status_obj = client.messages.batches.retrieve(batch_id)
+            status = getattr(status_obj, "processing_status", None)
+            logger.info("[resume] Batch %s current status: %s", batch_id, status)
+            
+            # If still processing, wait a bit more (max 5 minutes)
+            if status not in ("ended", "completed", "cancelled", "expired", "failed"):
+                logger.info("[resume] Batch %s still processing, waiting up to 5 minutes...", batch_id)
+                wait_start = time.time()
+                while time.time() - wait_start < 300:  # 5 minutes
+                    time.sleep(10)
+                    status_obj = client.messages.batches.retrieve(batch_id)
+                    status = getattr(status_obj, "processing_status", None)
+                    logger.info("[resume] Batch %s status: %s", batch_id, status)
+                    if status in ("ended", "completed", "cancelled", "expired", "failed"):
+                        break
+            
+            # Fetch results
+            results_iter = client.messages.batches.results(batch_id)
+            try:
+                raw_results = list(results_iter)
+            except Exception:
+                raw_results = getattr(results_iter, "data", None) or results_iter.get("data", [])
+            
+            logger.info("[resume] Batch %s returned %s results", batch_id, len(raw_results))
+            
+            # Build custom_id to row mapping
+            row_map = {r["custom_id"]: r for r in rows_minimal}
+            # Prepare a queue for items that require resume (pause_turn)
+            resume_queue: List[Dict[str, Any]] = []
+            
+            # Process results (similar to main batch processing)
+            for item in raw_results:
+                custom_id = getattr(item, "custom_id", None)
+                result_obj = getattr(item, "result", None)
+                
+                if getattr(result_obj, "type", None) != "succeeded":
+                    err_wrapper = getattr(result_obj, "error", None)
+                    err_inner = getattr(err_wrapper, "error", None)
+                    err_msg = getattr(err_inner, "message", None) or getattr(err_wrapper, "message", None) or None
+                    if err_msg:
+                        logger.error("[resume] Batch item failed for %s: %s", custom_id, err_msg)
+                    
+                    row_minimal = row_map.get(custom_id)
+                    if row_minimal:
+                        # Reconstruct full row for checkpoint with necessary fields
+                        full_row = {
+                            "brand": row_minimal.get("brand", ""),
+                            "product_name": row_minimal.get("product_name", ""),
+                            "shade_of_lipstick": row_minimal.get("shade_of_lipstick", ""),
+                            "sku": row_minimal.get("sku", ""),
+                            "category": row_minimal.get("category", ""),
+                            "sub_category": row_minimal.get("sub_category", ""),
+                            "leaf_level_category": row_minimal.get("leaf_level_category", ""),
+                            "full_name": row_minimal.get("full_name", ""),
+                            "s_no": row_minimal.get("s_no", ""),
+                        }
+                        update_checkpoint(output_dir, full_row, False, load_checkpoint(output_dir))
+                    fail += 1
+                    continue
+                
+                message = getattr(result_obj, "message", None)
+                row_minimal = row_map.get(custom_id)
+                if not row_minimal:
+                    logger.warning("[resume] Result with custom_id=%s has no matching row", custom_id)
+                    fail += 1
+                    continue
+                
+                # Reconstruct full row
+                full_row = {
+                    "brand": row_minimal.get("brand", ""),
+                    "product_name": row_minimal.get("product_name", ""),
+                    "shade_of_lipstick": row_minimal.get("shade_of_lipstick", ""),
+                    "sku": row_minimal.get("sku", ""),
+                    "category": row_minimal.get("category", ""),
+                    "sub_category": row_minimal.get("sub_category", ""),
+                    "leaf_level_category": row_minimal.get("leaf_level_category", ""),
+                    "full_name": row_minimal.get("full_name", ""),
+                    "s_no": row_minimal.get("s_no", ""),
+                }
+                
+                filename = create_output_filename(full_row)
+                filepath = os.path.join(output_dir, filename)
+                
+                # Write full raw resume item as plain text (serialized JSON) sidecar
+                try:
+                    base_no_ext = os.path.splitext(filename)[0]
+                    raw_result_txt_path = os.path.join(output_dir, f"{base_no_ext}.raw.result.txt")
+                    raw_serialized = _to_json_serializable(item)
+                    with open(raw_result_txt_path, "w", encoding="utf-8") as f_rawtxt:
+                        f_rawtxt.write(json.dumps(raw_serialized, ensure_ascii=False, indent=2))
+                except Exception:
+                    logger.debug("[resume] Failed to write raw result text sidecar for %s", filename)
+                
+                # Extract text from message
+                try:
+                    content_blocks = getattr(message, "content", None) or []
+                    parts = []
+                    for c in content_blocks:
+                        if getattr(c, "type", None) == "text":
+                            parts.append(getattr(c, "text", ""))
+                    
+                    if not parts:
+                        fallback_text = getattr(message, "output_text", None) or getattr(message, "text", None)
+                        if isinstance(fallback_text, str) and fallback_text.strip():
+                            parts = [fallback_text]
+                    
+                    # Handle pause_turn by queueing a resume request
+                    try:
+                        stop_reason = getattr(message, "stop_reason", None)
+                    except Exception:
+                        stop_reason = None
+                    if stop_reason == "pause_turn":
+                        try:
+                            _, original_user_text = build_user_message(full_row, use_natural_generation=True)
+                        except Exception:
+                            original_user_text = ""
+                        resume_queue.append({
+                            "custom_id": custom_id,
+                            "row": full_row,
+                            "original_user_text": original_user_text,
+                            "combined_blocks": _clean_orphan_tool_use(_to_json_serializable(content_blocks)),
+                        })
+                        # Defer finalization to the resume batch
+                        continue
+                    
+                    text = (parts[-1] if parts else "").strip()
+                    raw_for_parse = extract_first_json_object(text) or text
+                    obj = json.loads(raw_for_parse)
+                    
+                    # Track usage
+                    usage = getattr(message, "usage", None)
+                    try:
+                        if isinstance(usage, dict):
+                            in_tok = int(usage.get("input_tokens", 0) or 0)
+                            out_tok = int(usage.get("output_tokens", 0) or 0)
+                        else:
+                            in_tok = int(getattr(usage, "input_tokens", 0) or 0)
+                            out_tok = int(getattr(usage, "output_tokens", 0) or 0)
+                        total_input_tokens += in_tok
+                        total_output_tokens += out_tok
+                    except Exception:
+                        pass
+                    
+                except Exception as e:
+                    logger.error("[resume] Failed to parse JSON for %s: %s", custom_id, e)
+                    update_checkpoint(output_dir, full_row, False, load_checkpoint(output_dir))
+                    fail += 1
+                    continue
+                
+                # Save output
+                try:
+                    with open(filepath, "w", encoding="utf-8") as out:
+                        json.dump(obj, out, ensure_ascii=False, indent=2)
+                except Exception as e:
+                    logger.error("[resume] Failed to write output for %s: %s", filename, e)
+                    update_checkpoint(output_dir, full_row, False, load_checkpoint(output_dir))
+                    fail += 1
+                    continue
+                
+                # Trigger ingestion
+                ing_ok = True
+                if not no_ingest:
+                    ing_ok = trigger_ingestion(filepath, logger)
+                else:
+                    logger.info("[resume] Auto-ingest disabled; skipping ingestion for %s", filepath)
+                
+                update_checkpoint(output_dir, full_row, ing_ok, load_checkpoint(output_dir))
+                if ing_ok:
+                    ok += 1
+                else:
+                    fail += 1
+            
+            # Mark batch as completed
+            mark_batch_completed(output_dir, batch_id)
+            logger.info("[resume] Batch %s marked as completed", batch_id)
+            
+            # If we have pause_turn items, submit a follow-up resume batch (mirrors main flow)
+            while resume_queue:
+                try:
+                    logger.info("[resume] Starting resume follow-up for %s items", len(resume_queue))
+                except Exception:
+                    pass
+                resume_requests: List[Any] = []
+                for r in resume_queue:
+                    custom_id_r = r["custom_id"]
+                    row_r = r["row"]
+                    original_user_text_r = r.get("original_user_text", "")
+                    combined_blocks_r = _clean_orphan_tool_use(r.get("combined_blocks", []))
+                    messages_r = [
+                        {"role": "user", "content": original_user_text_r},
+                        {"role": "assistant", "content": combined_blocks_r},
+                        {"role": "user", "content": "Please continue and Return ONLY the final JSON now. No preface, no markdown, no commentary. Use the existing search results above"},
+                    ]
+                    params_r = {
+                        "model": model,
+                        "max_tokens": max_tokens,
+                        "temperature": DEFAULT_TEMPERATURE,
+                        "system": shared_system,
+                        "messages": messages_r,
+                        "tools": [
+                            {
+                                "type": "web_search_20250305",
+                                "name": "web_search",
+                                "max_uses": 15,
+                            }
+                        ],
+                    }
+                    if ENABLE_THINKING:
+                        params_r["thinking"] = {
+                            "type": "enabled",
+                            "budget_tokens": 31999,
+                        }
+                    if MessageCreateParamsNonStreaming and BatchRequest:
+                        resume_requests.append(
+                            BatchRequest(
+                                custom_id=custom_id_r,
+                                params=MessageCreateParamsNonStreaming(**params_r)
+                            )
+                        )
+                    else:
+                        resume_requests.append({"custom_id": custom_id_r, "params": params_r})
+                
+                # Submit and process the resume batch
+                try:
+                    resume_batch = client.messages.batches.create(requests=resume_requests)
+                    resume_batch_id = getattr(resume_batch, "id", None) or resume_batch["id"]  # type: ignore
+                    logger.info("[resume] Resume batch submitted: id=%s", resume_batch_id)
+                    # Poll until terminal
+                    while True:
+                        st = client.messages.batches.retrieve(resume_batch_id)
+                        st_status = getattr(st, "processing_status", None)
+                        logger.info("[resume] Resume batch %s status: %s", resume_batch_id, st_status)
+                        if st_status is None or st_status in ("ended", "completed", "cancelled", "expired", "failed"):
+                            break
+                        time.sleep(3)
+                    # Fetch results
+                    resume_results_iter = client.messages.batches.results(resume_batch_id)
+                    try:
+                        resume_items = list(resume_results_iter)
+                    except Exception:
+                        resume_items = getattr(resume_results_iter, "data", None) or resume_results_iter.get("data", [])  # type: ignore
+                except Exception as e_res:
+                    logger.error("[resume] Resume batch submission failed: %s", e_res)
+                    for r in resume_queue:
+                        update_checkpoint(output_dir, r["row"], False, load_checkpoint(output_dir))
+                        fail += 1
+                    resume_queue = []
+                    break
+                
+                # Map and process resume results
+                resume_map = {r["custom_id"]: r for r in resume_queue}
+                next_round: List[Dict[str, Any]] = []
+                for item_r in resume_items:
+                    custom_id_r = getattr(item_r, "custom_id", None)
+                    result_obj_r = getattr(item_r, "result", None)
+                    if getattr(result_obj_r, "type", None) != "succeeded":
+                        r = resume_map.get(custom_id_r)
+                        if r:
+                            update_checkpoint(output_dir, r["row"], False, load_checkpoint(output_dir))
+                            fail += 1
+                        continue
+                    message_r = getattr(result_obj_r, "message", None)
+                    content_blocks_r = getattr(message_r, "content", None) or []
+                    stop_reason_r = getattr(message_r, "stop_reason", None)
+                    prior = resume_map.get(custom_id_r)
+                    if not prior:
+                        continue
+                    combined_so_far = prior.get("combined_blocks", [])
+                    combined_so_far.extend(_clean_orphan_tool_use(content_blocks_r))
+                    
+                    # Usage accumulation (best-effort)
+                    usage_r = getattr(message_r, "usage", None)
+                    try:
+                        if isinstance(usage_r, dict):
+                            in_tok = int(usage_r.get("input_tokens", 0) or 0)
+                            out_tok = int(usage_r.get("output_tokens", 0) or 0)
+                        else:
+                            in_tok = int(getattr(usage_r, "input_tokens", 0) or 0)
+                            out_tok = int(getattr(usage_r, "output_tokens", 0) or 0)
+                        total_input_tokens += in_tok
+                        total_output_tokens += out_tok
+                        logger.info("[resume][usage] custom_id=%s in+=%s out+=%s", custom_id_r, in_tok, out_tok)
+                    except Exception:
+                        pass
+                    
+                    # Cache metrics for resume requests (best-effort)
+                    try:
+                        cache_status_r = None
+                        cache_token_credits_r = None
+                        headers_r = (
+                            getattr(message_r, "response_headers", None)
+                            or getattr(message_r, "headers", None)
+                            or getattr(item_r, "response_headers", None)
+                            or getattr(item_r, "headers", None)
+                            or {}
+                        )
+                        if isinstance(headers_r, dict):
+                            cache_status_r = headers_r.get("anthropic-cache-status") or headers_r.get("x-anthropic-cache-status")
+                            cache_token_credits_r = headers_r.get("anthropic-cache-token-credits")
+                        if isinstance(usage_r, dict):
+                            cache_status_r = cache_status_r or usage_r.get("anthropic-cache-status")
+                            cache_token_credits_r = cache_token_credits_r or usage_r.get("anthropic-cache-token-credits")
+                        if cache_status_r or cache_token_credits_r:
+                            logger.info("[resume][cache] custom_id=%s status=%s token_credits=%s", custom_id_r, cache_status_r, cache_token_credits_r)
+                        else:
+                            logger.info("[resume][cache] custom_id=%s status=%s", custom_id_r, None)
+                    except Exception:
+                        logger.debug("Failed to read cache headers for resume custom_id=%s", custom_id_r)
+                    
+                    if stop_reason_r == "pause_turn":
+                        next_round.append({
+                            "custom_id": custom_id_r,
+                            "row": prior["row"],
+                            "original_user_text": prior.get("original_user_text", ""),
+                            "combined_blocks": combined_so_far,
+                        })
+                        continue
+                    
+                    # Terminal: finalize
+                    r_row = prior["row"]
+                    filename_r = create_output_filename(r_row)
+                    filepath_r = os.path.join(output_dir, filename_r)
+                    resumed_parts = [b.get("text", "") for b in combined_so_far if isinstance(b, dict) and b.get("type") == "text" and b.get("text")]
+                    text_final = ("\n".join(resumed_parts)).strip() if resumed_parts else ""
+                    raw_for_parse_r = extract_first_json_object(text_final) or text_final
+                    try:
+                        obj_r = json.loads(raw_for_parse_r)
+                    except Exception as e_json:
+                        logger.error("[resume] Failed to parse resumed JSON for %s: %s", custom_id_r, e_json)
+                        update_checkpoint(output_dir, r_row, False, load_checkpoint(output_dir))
+                        fail += 1
+                        continue
+                    try:
+                        with open(filepath_r, "w", encoding="utf-8") as out:
+                            json.dump(obj_r, out, ensure_ascii=False, indent=2)
+                    except Exception as e_write:
+                        logger.error("[resume] Failed to write output for %s: %s", filename_r, e_write)
+                        update_checkpoint(output_dir, r_row, False, load_checkpoint(output_dir))
+                        fail += 1
+                        continue
+                    ing_ok_r = True
+                    if not no_ingest:
+                        ing_ok_r = trigger_ingestion(filepath_r, logger)
+                    else:
+                        logger.info("[resume] Auto-ingest disabled; skipping ingestion for %s", filepath_r)
+                    update_checkpoint(output_dir, r_row, ing_ok_r, load_checkpoint(output_dir))
+                    if ing_ok_r:
+                        ok += 1
+                    else:
+                        fail += 1
+                
+                # Prepare for another follow-up round if any still paused
+                resume_queue = next_round
+            
+        except Exception as e:
+            logger.error("[resume] Error processing batch %s: %s", batch_id, e)
+            # Mark all rows in this batch as failed
+            for row_minimal in rows_minimal:
+                full_row = {
+                    "brand": row_minimal.get("brand", ""),
+                    "product_name": row_minimal.get("product_name", ""),
+                    "shade_of_lipstick": row_minimal.get("shade_of_lipstick", ""),
+                    "sku": row_minimal.get("sku", ""),
+                    "s_no": row_minimal.get("s_no", ""),
+                }
+                update_checkpoint(output_dir, full_row, False, load_checkpoint(output_dir))
+            fail += len(rows_minimal)
+    
+    return ok, fail, total_input_tokens, total_output_tokens
+
+
+def build_user_message(product_row: Dict[str, str], use_natural_generation: bool = True) -> Tuple[str, str]:
     # Map CSV fields to the schema keys commonly used in your lipstick template
+    # Validate required fields before constructing the payload
+    required_keys = ["brand", "product_name", "shade_of_lipstick", "s_no"]
+    missing = [k for k in required_keys if not (product_row.get(k) or "").strip()]
+    if missing:
+        raise ValueError(f"Missing required fields for user message: {', '.join(missing)}")
+
     product_for_model = {
         "brand": product_row["brand"],
         "product_line": product_row["product_name"],  # maps to template's product_line
@@ -1212,46 +1828,18 @@ def build_user_message(prompt_text: str, product_row: Dict[str, str], use_natura
         "category": product_row.get("category", ""),
         "sub_category": product_row.get("sub_category", ""),
         "leaf_level_category": product_row.get("leaf_level_category", ""),
-        # Pass-through optional dynamic metrics (may be empty strings)
-        "l_star": product_row.get("l_star", ""),
-        "a_star": product_row.get("a_star", ""),
-        "b_star": product_row.get("b_star", ""),
-        "c_star": product_row.get("c_star", ""),
-        "h_deg": product_row.get("h_deg", ""),
-        "sR": product_row.get("sR", ""),
-        "sG": product_row.get("sG", ""),
-        "sB": product_row.get("sB", ""),
-        "gloss": product_row.get("gloss", ""),
         "s_no": product_row.get("s_no", ""),
     }
 
     if use_natural_generation:
-        # Build a STATIC system message (cacheable) with prompt_text only
-        # The OUTPUT_FORMAT is already included in the prompt file
-        system_text = textwrap.dedent(
-            f"""
-            {prompt_text}
-
-            CRITICAL FORMATTING REQUIREMENTS:
-            - Return ONLY valid JSON (no markdown, no commentary)
-            - Follow the OUTPUT_FORMAT structure defined in the prompt
-            - Do NOT include code fences (```), markdown, prose, or any text before/after the JSON
-            - Follow the section and QA counts from the PROMPT'S STRUCTURE 
-            - Expand arrays to meet the PROMPT requirements even if the example shows fewer items
-            - Use the exact product keys shown (including "sku", "category", "sub_category", "leaf_level_category"); keys must always be present (empty string allowed if unknown)
-            - Do NOT include any citations, footnotes, source markers, or attribution (e.g., <cite ...>...</cite>, [1], (ref), URLs). Present everything as expert knowledge.
-            """
-        ).strip()
-
-        # Dynamic per-product message (non-cacheable)
+        # Dynamic per-product message (non-cacheable). System is supplied elsewhere for batching.
         user_text = textwrap.dedent(
             f"""
             Product Information:
             {json.dumps(product_for_model, ensure_ascii=False, indent=2)}
             """
         ).strip()
-
-        return system_text, user_text
+        return "", user_text
     else:
         raise ValueError("use_natural_generation=False is not supported. Refusing to build an alternate prompt shape.")
 
@@ -1478,109 +2066,6 @@ def _clean_orphan_tool_use(blocks: List[Any]) -> List[Dict[str, Any]]:
     return filtered
 
 
-def _resume_until_end_turn(
-    api_key: str,
-    model: str,
-    system_blocks: List[Dict[str, Any]],
-    original_user_text: str,
-    paused_assistant_blocks: List[Any],
-    max_tokens: int,
-    use_cache: bool,
-    logger: logging.Logger,
-    tools: List[Dict[str, Any]],
-    thinking: Dict[str, Any],
-) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    """Resume a pause_turn conversation by re-sending assistant blocks + a 'Please continue' turn.
-    Returns (combined_assistant_blocks, usage_totals).
-    """
-    headers = {
-        "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
-    # Keep beta headers consistent with batch/sync usage: include web_search beta always; add prompt-caching beta when caching is enabled
-    headers["anthropic-beta"] = (
-        "prompt-caching-2024-07-31, web-search-2025-03-05" if use_cache else "web-search-2025-03-05"
-    )
-
-    combined_blocks: List[Dict[str, Any]] = _clean_orphan_tool_use(paused_assistant_blocks)
-    usage_totals = {"input_tokens": 0, "output_tokens": 0}
-
-    attempts = 0
-    while True:
-        # History: original user -> assistant (combined so far) -> user continue
-        messages = [
-            {"role": "user", "content": original_user_text},
-            {"role": "assistant", "content": combined_blocks},
-            {"role": "user", "content": "Please continue and return ONLY the final JSON now."},
-        ]
-
-        payload: Dict[str, Any] = {
-            "model": model,
-            "max_tokens": max_tokens,
-            "temperature": DEFAULT_TEMPERATURE,
-            # IMPORTANT: reuse the original system_blocks object to preserve exact
-            # cache_control markers and byte-for-byte identity for prompt caching
-            "system": system_blocks,
-            "messages": messages,
-            "tools": tools,
-            "thinking": thinking,
-        }
-
-        attempts += 1
-        try:
-            logger.info("[resume] attempt=%s sending continuation request (messages=%s blocks)", attempts, sum(len(m.get("content", [])) for m in messages if isinstance(m.get("content", []), list)))
-        except Exception:
-            pass
-
-        try:
-            resp = requests.post(ANTHROPIC_API_URL, headers=headers, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-        except requests.exceptions.RequestException as e:
-            # Log details and break, returning partial combined blocks
-            status = getattr(getattr(e, "response", None), "status_code", None)
-            body = None
-            try:
-                body = getattr(e, "response", None).text if getattr(e, "response", None) else None
-            except Exception:
-                body = None
-            logger.error(
-                "[resume] request failed: %s status=%s body_snippet=%s",
-                e, status, (body[:300] + "...") if body else None
-            )
-            break
-        except ValueError as e:
-            # JSON parsing of response failed
-            logger.error("[resume] invalid JSON in resume response: %s", e)
-            break
-
-        # Track usage
-        try:
-            usage = data.get("usage", {}) or {}
-            usage_totals["input_tokens"] += int(usage.get("input_tokens", 0) or 0)
-            usage_totals["output_tokens"] += int(usage.get("output_tokens", 0) or 0)
-            logger.info("[resume][usage] in=%s out=%s (cumulative)", usage_totals["input_tokens"], usage_totals["output_tokens"])
-        except Exception:
-            pass
-
-        # Read stop_reason and content blocks
-        stop_reason = data.get("stop_reason")
-        new_blocks = data.get("content", []) or []
-        if not isinstance(new_blocks, list):
-            new_blocks = []
-
-        # Merge into combined (preserve all prior blocks)
-        combined_blocks.extend(_clean_orphan_tool_use(new_blocks))
-
-        if stop_reason and stop_reason != "pause_turn":
-            logger.info("[resume] reached terminal stop_reason=%s", stop_reason)
-            break
-        # Continue resuming until a terminal stop_reason is reached
-        logger.info("[resume] still paused; continuing loop (attempt=%s)", attempts)
-
-    return combined_blocks, usage_totals
-
 
 # ------------------------------
 # Main
@@ -1595,9 +2080,10 @@ def main() -> None:
     parser.add_argument("--no_batch", action="store_true", help="Disable Anthropic Message Batches API and use synchronous requests")
     parser.add_argument("--no_sidecars", action="store_true", help="Do not write raw/audit sidecar files alongside the main JSON output")
     parser.add_argument("--no_cache", action="store_true", help="Disable Anthropic prompt caching (use for token price comparison)")
+    parser.add_argument("--resume_batches", action="store_true", help="Resume processing of pending batches that timed out during polling")
     args, unknown = parser.parse_known_args()
     # Hardcoded file paths
-    prompt_path = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/data/final-prompt-hf.json"
+    prompt_path = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/data/beauty_prompt_consolidated.json"
     
     # Data source selection based on USE_EXCEL_DATA parameter
     if USE_EXCEL_DATA:
@@ -1661,6 +2147,50 @@ def main() -> None:
         logger.info("argv=%s no_cache=%r use_prompt_cache=%r", sys.argv, args.no_cache, use_prompt_cache)
     except Exception:
         pass
+
+    # RESUME MODE: If --resume_batches is passed, process pending batches and exit
+    if args.resume_batches:
+        logger.info("🔄 RESUME MODE: Processing pending batches...")
+        logger.info("="*60)
+        
+        # Load prompt (needed for resume processing)
+        try:
+            prompt_text = read_prompt(prompt_path)
+            logger.info(f"Loaded prompt from: {prompt_path}")
+        except Exception as e:
+            logger.error(f"Failed to load prompt file: {e}")
+            sys.exit(1)
+        
+        # Call resume function
+        resume_start = time.time()
+        ok, fail, in_tok, out_tok = resume_pending_batches(
+            api_key=api_key,
+            model=model,
+            prompt_text=prompt_text,
+            max_tokens=max_tokens,
+            output_dir=output_dir,
+            logger=logger,
+            no_ingest=args.no_ingest,
+            use_cache=use_prompt_cache,
+        )
+        resume_time = time.time() - resume_start
+        
+        # Print summary and exit
+        logger.info("="*60)
+        logger.info("Batch Resume Completed")
+        logger.info(f"End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"Duration: {resume_time:.2f} seconds ({resume_time/60:.2f} minutes)")
+        logger.info("")
+        logger.info("📊 RESUME STATISTICS:")
+        logger.info(f"   Products processed: {ok + fail}")
+        logger.info(f"   Successful: {ok}")
+        logger.info(f"   Failed: {fail}")
+        logger.info(f"   Success rate: {(ok/(ok+fail)*100):.1f}%" if (ok+fail) > 0 else "N/A")
+        logger.info("")
+        logger.info(f"💰 Token usage: {in_tok:,} input + {out_tok:,} output = {in_tok + out_tok:,}")
+        logger.info(f"📁 Output directory: {output_dir}")
+        logger.info("="*60)
+        sys.exit(0)
 
     # Load configuration files
     logger.info("Loading configuration files...")
@@ -1849,7 +2379,7 @@ def main() -> None:
         except Exception as _e:
             logger.warning("Unexpected error during sidecar reprocessing path for %s: %s", filename, _e)
 
-        system_text, user_msg = build_user_message(prompt_text, row, use_natural_generation=True)
+        system_text, user_msg = build_user_message(row, use_natural_generation=True)
         
         try:
             raw, usage_info = call_claude_with_web_search(

@@ -68,14 +68,14 @@ except Exception:  # SDK may not expose types; we'll fall back to plain dicts
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 DEFAULT_MODEL = "claude-opus-4-1-20250805"  # From your example
 # Default batch size for Anthropic Message Batches (change here if needed)
-BATCH_SIZE_DEFAULT = 4
+BATCH_SIZE_DEFAULT = 2
 # Default temperature for both sync and batch calls
 DEFAULT_TEMPERATURE = 1
 
 # Control extra artifact creation without CLI args
 WRITE_RAW_FULL: bool = False
 WRITE_AUDIT_FILES: bool = False
-USE_EXCEL_DATA: bool = False
+USE_EXCEL_DATA: bool = True
 ENABLE_THINKING: bool = True
 
 # ------------------------------
@@ -173,76 +173,6 @@ def convert_sharepoint_url(share_url: str) -> str:
         pass
 
     return share_url
-
-
-def extract_first_json_object(text: str) -> str | None:
-    """Heuristically extract the first top-level JSON object from a string.
-    Returns the JSON substring if found, else None.
-    """
-    # Strip code fences if any remain
-    s = text.strip()
-    if s.startswith("```"):
-        s = s.strip("`")
-        if s.lower().startswith("json"):
-            s = s[4:].lstrip()
-
-    # Fast path: already valid JSON
-    try:
-        json.loads(s)
-        return s
-    except Exception:
-        pass
-
-    # Find first '{' and attempt to match a balanced object, ignoring braces inside strings
-    start = s.find('{')
-    if start == -1:
-        return None
-
-    depth = 0
-    in_string = False
-    string_char = ''
-    escaped = False
-    match_end = -1
-    for i in range(start, len(s)):
-        ch = s[i]
-        if in_string:
-            if escaped:
-                escaped = False
-            elif ch == '\\':
-                escaped = True
-            elif ch == string_char:
-                in_string = False
-        else:
-            if ch in ('"', "'"):
-                in_string = True
-                string_char = ch
-            elif ch == '{':
-                depth += 1
-            elif ch == '}':
-                depth -= 1
-                if depth == 0:
-                    match_end = i
-                    candidate = s[start:match_end+1]
-                    try:
-                        json.loads(candidate)
-                        return candidate
-                    except Exception:
-                        # keep scanning; there might be another valid block later
-                        pass
-
-    # Best-effort fallback for truncated outputs:
-    # Try from the first '{' to the last '}' if present
-    last_close = s.rfind('}')
-    if last_close != -1 and last_close > start:
-        candidate = s[start:last_close+1]
-        try:
-            json.loads(candidate)
-            return candidate
-        except Exception:
-            pass
-
-    # No valid object could be extracted
-    return None
 
 
 def normalize_row(raw: Dict[str, str]) -> Dict[str, str]:
@@ -882,8 +812,8 @@ def run_batch_generation(
 
                     # Use only the FINAL text block as the model's answer
                     text = (parts[-1] if parts else "").strip()
-                    raw_for_parse = extract_first_json_object(text) or text
-                    obj = json.loads(raw_for_parse)
+                    # Save raw text directly without JSON parsing
+                    json_text = text
                     # Accumulate token usage if present
                     usage = getattr(message, "usage", None)
                     try:
@@ -908,10 +838,15 @@ def run_batch_generation(
                     fail += 1
                     continue
 
-                # Save output JSON
+                # Save output JSON (write raw text directly)
                 try:
                     with open(filepath, "w", encoding="utf-8") as out:
-                        json.dump(obj, out, ensure_ascii=False, indent=2)
+                        try:
+                            # Try to parse and save clean JSON
+                            json.dump(json.loads(json_text), out, ensure_ascii=False, indent=2)
+                        except json.JSONDecodeError:
+                            # If parsing fails, write raw text as fallback
+                            out.write(json_text)
                 except Exception as e:
                     logger.error("Failed to write output for %s: %s", filename, e)
                     update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
@@ -973,6 +908,8 @@ def run_batch_generation(
                             "type": "enabled",
                             "budget_tokens": 31999,
                         }
+                    custom_id = _make_custom_id(row)
+
                     if MessageCreateParamsNonStreaming and BatchRequest:
                         resume_requests.append(
                             BatchRequest(
@@ -981,6 +918,7 @@ def run_batch_generation(
                             )
                         )
                     else:
+                        # Fallback compatible with SDK expecting dicts
                         resume_requests.append({"custom_id": custom_id_r, "params": params_r})
 
                 # Submit resume batch
@@ -1111,14 +1049,8 @@ def run_batch_generation(
                     # Extract and merge all text blocks
                     resumed_parts = [b.get("text", "") for b in combined_so_far if isinstance(b, dict) and b.get("type") == "text" and b.get("text")]
                     text_final = ("\n".join(resumed_parts)).strip() if resumed_parts else ""
-                    raw_for_parse = extract_first_json_object(text_final) or text_final
-                    try:
-                        obj = json.loads(raw_for_parse)
-                    except Exception as e_json:
-                        logger.error("Failed to parse resumed JSON for %s: %s", custom_id_r, e_json)
-                        update_checkpoint(output_dir, r_row, False, load_checkpoint(output_dir))
-                        fail += 1
-                        continue
+                    # Save raw resumed text directly without JSON parsing
+                    json_text_final = text_final
 
                     # Optional raw text dump
                     if WRITE_RAW_FULL:
@@ -1130,10 +1062,15 @@ def run_batch_generation(
                         except Exception:
                             logger.debug("Failed to write resume raw text for %s", filename)
 
-                    # Write output JSON
+                    # Write output JSON (raw text)
                     try:
                         with open(filepath, "w", encoding="utf-8") as out:
-                            json.dump(obj, out, ensure_ascii=False, indent=2)
+                            try:
+                                # Try to parse and save clean JSON
+                                json.dump(json.loads(json_text_final), out, ensure_ascii=False, indent=2)
+                            except json.JSONDecodeError:
+                                # If parsing fails, write raw text as fallback
+                                out.write(json_text_final)
                     except Exception as e_write:
                         logger.error("Failed to write output for %s: %s", filename, e_write)
                         update_checkpoint(output_dir, r_row, False, load_checkpoint(output_dir))
@@ -1480,7 +1417,7 @@ def resume_pending_batches(
                     err_inner = getattr(err_wrapper, "error", None)
                     err_msg = getattr(err_inner, "message", None) or getattr(err_wrapper, "message", None) or None
                     if err_msg:
-                        logger.error("[resume] Batch item failed for %s: %s", custom_id, err_msg)
+                        logger.error("[resume] Batch item failed: %s -> %s", custom_id, err_msg)
                     
                     row_minimal = row_map.get(custom_id)
                     if row_minimal:
@@ -1552,6 +1489,7 @@ def resume_pending_batches(
                     except Exception:
                         stop_reason = None
                     if stop_reason == "pause_turn":
+                        # Queue for parallel resume via a second batch
                         try:
                             _, original_user_text = build_user_message(full_row, use_natural_generation=True)
                         except Exception:
@@ -1562,12 +1500,18 @@ def resume_pending_batches(
                             "original_user_text": original_user_text,
                             "combined_blocks": _clean_orphan_tool_use(_to_json_serializable(content_blocks)),
                         })
-                        # Defer finalization to the resume batch
+                        # Skip finalization for now; will be handled in resume batch
                         continue
                     
                     text = (parts[-1] if parts else "").strip()
-                    raw_for_parse = extract_first_json_object(text) or text
-                    obj = json.loads(raw_for_parse)
+                    try:
+                        # Try to parse JSON directly
+                        obj = json.loads(text)
+                    except json.JSONDecodeError:
+                        logger.error("[resume] Failed to parse JSON for %s: %s. Text preview: %s", custom_id, e, text[:200])
+                        update_checkpoint(output_dir, full_row, False, load_checkpoint(output_dir))
+                        fail += 1
+                        continue
                     
                     # Track usage
                     usage = getattr(message, "usage", None)
@@ -1592,7 +1536,12 @@ def resume_pending_batches(
                 # Save output
                 try:
                     with open(filepath, "w", encoding="utf-8") as out:
-                        json.dump(obj, out, ensure_ascii=False, indent=2)
+                        try:
+                            # Try to parse and save clean JSON
+                            json.dump(obj, out, ensure_ascii=False, indent=2)
+                        except json.JSONDecodeError:
+                            # If parsing fails, write raw text as fallback
+                            out.write(text)
                 except Exception as e:
                     logger.error("[resume] Failed to write output for %s: %s", filename, e)
                     update_checkpoint(output_dir, full_row, False, load_checkpoint(output_dir))
@@ -1643,7 +1592,7 @@ def resume_pending_batches(
                             {
                                 "type": "web_search_20250305",
                                 "name": "web_search",
-                                "max_uses": 15,
+                                "max_uses": 10,
                             }
                         ],
                     }
@@ -1764,7 +1713,7 @@ def resume_pending_batches(
                     filepath_r = os.path.join(output_dir, filename_r)
                     resumed_parts = [b.get("text", "") for b in combined_so_far if isinstance(b, dict) and b.get("type") == "text" and b.get("text")]
                     text_final = ("\n".join(resumed_parts)).strip() if resumed_parts else ""
-                    raw_for_parse_r = extract_first_json_object(text_final) or text_final
+                    raw_for_parse_r = text_final
                     try:
                         obj_r = json.loads(raw_for_parse_r)
                     except Exception as e_json:
@@ -1802,8 +1751,7 @@ def resume_pending_batches(
                     "brand": row_minimal.get("brand", ""),
                     "product_name": row_minimal.get("product_name", ""),
                     "shade_of_lipstick": row_minimal.get("shade_of_lipstick", ""),
-                    "sku": row_minimal.get("sku", ""),
-                    "s_no": row_minimal.get("s_no", ""),
+                    "sku": row_minimal.get("sku", "")
                 }
                 update_checkpoint(output_dir, full_row, False, load_checkpoint(output_dir))
             fail += len(rows_minimal)
@@ -2083,11 +2031,12 @@ def main() -> None:
     parser.add_argument("--resume_batches", action="store_true", help="Resume processing of pending batches that timed out during polling")
     args, unknown = parser.parse_known_args()
     # Hardcoded file paths
-    prompt_path = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/data/beauty_prompt_consolidated.json"
+    prompt_path = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/data/beauty_prompt_consolidated (7).json"
     
     # Data source selection based on USE_EXCEL_DATA parameter
     if USE_EXCEL_DATA:
-        input_data_path = "https://kult20256-my.sharepoint.com/:x:/g/personal/harshit_a_kult_app/ER4mU46_r9VAu0XCFYkVzD8Be1E4BFyHPulmXQYVf0ZTtQ?e=H0FrNA"
+        # input_data_path = "https://kult20256-my.sharepoint.com/:x:/g/personal/harshit_a_kult_app/ER4mU46_r9VAu0XCFYkVzD8Be1E4BFyHPulmXQYVf0ZTtQ?e=H0FrNA"
+        input_data_path = "https://kult20256-my.sharepoint.com/:x:/g/personal/srushti_kult_app/EX5Vg0krs25Ivpvupcn4_uIBTOmgOmadWw82laanvdeh2g?e=fGfOBn"
         logger = logging.getLogger(__name__)
         logger.info("Using Excel data source (online): SharePoint")
     else:
@@ -2344,12 +2293,17 @@ def main() -> None:
 
                 if raw_text:
                     # Try to extract and parse JSON from the saved raw LLM text
-                    recovered = extract_first_json_object(raw_text) or raw_text
+                    recovered = raw_text
                     try:
                         obj = json.loads(recovered)
                         # Save file
                         with open(filepath, "w", encoding="utf-8") as out:
-                            json.dump(obj, out, ensure_ascii=False, indent=2)
+                            try:
+                                # Try to parse and save clean JSON
+                                json.dump(obj, out, ensure_ascii=False, indent=2)
+                            except json.JSONDecodeError:
+                                # If parsing fails, write raw text as fallback
+                                out.write(raw_text)
 
                         # Optionally write parsed JSON as well
                         if debug_basepath:
@@ -2393,13 +2347,13 @@ def main() -> None:
             )
 
             # Pre-clean: many providers wrap JSON in ```json fences; extract first JSON block if present
-            raw_for_parse = extract_first_json_object(raw) or raw
+            raw_for_parse = raw
 
             try:
                 obj = json.loads(raw_for_parse)
             except json.JSONDecodeError:
                 # Attempt to extract JSON object if assistant added prose before/after
-                cleaned = extract_first_json_object(raw)
+                cleaned = raw
                 if cleaned is None:
                     raise
                 # Optionally write the cleaned JSON to debug
@@ -2419,7 +2373,12 @@ def main() -> None:
             
             # Save file
             with open(filepath, "w", encoding="utf-8") as out:
-                json.dump(obj, out, ensure_ascii=False, indent=2)
+                try:
+                    # Try to parse and save clean JSON
+                    json.dump(obj, out, ensure_ascii=False, indent=2)
+                except json.JSONDecodeError:
+                    # If parsing fails, write raw text as fallback
+                    out.write(raw)
 
             # Optionally write raw-response and/or audit file (disabled by default)
             if WRITE_RAW_FULL or WRITE_AUDIT_FILES:

@@ -64,19 +64,20 @@ try:
 except Exception:  # SDK may not expose types; we'll fall back to plain dicts
     MessageCreateParamsNonStreaming = None  # type: ignore
     BatchRequest = None  # type: ignore
+from openai import OpenAI
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 DEFAULT_MODEL = "claude-opus-4-1-20250805"  # From your example
 # Default batch size for Anthropic Message Batches (change here if needed)
-BATCH_SIZE_DEFAULT = 2
+BATCH_SIZE_DEFAULT = 3
 # Default temperature for both sync and batch calls
 DEFAULT_TEMPERATURE = 1
 
 # Control extra artifact creation without CLI args
-WRITE_RAW_FULL: bool = False
-WRITE_AUDIT_FILES: bool = False
-USE_EXCEL_DATA: bool = True
+USE_EXCEL_DATA: bool = False
 ENABLE_THINKING: bool = True
+USE_CLAUDE: bool = True
+USE_GPT: bool = False
 
 # ------------------------------
 # Logging Setup
@@ -782,33 +783,6 @@ def run_batch_generation(
                             "combined_blocks": _clean_orphan_tool_use(_to_json_serializable(content_blocks)),
                         })
                         continue
-                    
-                    # If enabled, write raw text response (batch mode)
-                    if WRITE_RAW_FULL:
-                        try:
-                            base_no_ext = os.path.splitext(filename)[0]
-                            raw_sidecar_path = os.path.join(output_dir, f"{base_no_ext}.raw.txt")
-                            
-                            # Extract all text content from the response
-                            all_text_parts = []
-                            for c in content_blocks:
-                                if getattr(c, "type", None) == "text":
-                                    all_text_parts.append(getattr(c, "text", ""))
-                            # Also include fallback_text if no text blocks were present
-                            if not all_text_parts:
-                                try:
-                                    fb_txt = getattr(message, "output_text", None) or getattr(message, "text", None)
-                                    if isinstance(fb_txt, str) and fb_txt.strip():
-                                        all_text_parts.append(fb_txt)
-                                except Exception:
-                                    pass
-                            
-                            # Save complete raw text response
-                            raw_text = "\n".join(all_text_parts)
-                            with open(raw_sidecar_path, "w", encoding="utf-8") as f_side:
-                                f_side.write(raw_text)
-                        except Exception as _:
-                            logger.debug("Failed to write raw text dump for %s", filename)
 
                     # Use only the FINAL text block as the model's answer
                     text = (parts[-1] if parts else "").strip()
@@ -926,6 +900,7 @@ def run_batch_generation(
                     resume_batch = client.messages.batches.create(requests=resume_requests)
                     resume_batch_id = getattr(resume_batch, "id", None) or resume_batch["id"]  # type: ignore
                     logger.info("Resume batch submitted: id=%s", resume_batch_id)
+                    
                     # Poll until terminal
                     while True:
                         st = client.messages.batches.retrieve(resume_batch_id)
@@ -1041,56 +1016,75 @@ def run_batch_generation(
                         })
                         continue
 
-                    # Terminal: finalize -> extract text, parse, write, ingest, checkpoint
-                    r_row = prior["row"]
-                    filename = create_output_filename(r_row)
-                    filepath = os.path.join(output_dir, filename)
-
-                    # Extract and merge all text blocks
-                    resumed_parts = [b.get("text", "") for b in combined_so_far if isinstance(b, dict) and b.get("type") == "text" and b.get("text")]
-                    text_final = ("\n".join(resumed_parts)).strip() if resumed_parts else ""
-                    # Save raw resumed text directly without JSON parsing
-                    json_text_final = text_final
-
-                    # Optional raw text dump
-                    if WRITE_RAW_FULL:
-                        try:
-                            base_no_ext = os.path.splitext(filename)[0]
-                            raw_sidecar_path = os.path.join(output_dir, f"{base_no_ext}.raw.txt")
-                            with open(raw_sidecar_path, "w", encoding="utf-8") as f_side:
-                                f_side.write(text_final)
-                        except Exception:
-                            logger.debug("Failed to write resume raw text for %s", filename)
-
-                    # Write output JSON (raw text)
                     try:
-                        with open(filepath, "w", encoding="utf-8") as out:
+                        # Terminal: finalize -> extract text, parse, write, ingest, checkpoint
+                        r_row = prior["row"]
+                        filename = create_output_filename(r_row)
+                        filepath = os.path.join(output_dir, filename)
+
+                        # Extract and merge all text blocks
+                        resumed_parts = [b.get("text", "") for b in combined_so_far if isinstance(b, dict) and b.get("type") == "text" and b.get("text")]
+                        text_final = ("\n".join(resumed_parts)).strip() if resumed_parts else ""
+                        # Save raw resumed text directly without JSON parsing
+                        json_text_final = text_final
+
+                        # Use only the FINAL text block as the model's answer
+                        text = (parts[-1] if parts else "").strip()
+                        # Save raw text directly without JSON parsing
+                        json_text = text
+                        # Accumulate token usage if present
+                        usage = getattr(message_r, "usage", None)
+                        try:
+                            if isinstance(usage, dict):
+                                in_tok = int(usage.get("input_tokens", 0) or 0)
+                                out_tok = int(usage.get("output_tokens", 0) or 0)
+                            else:
+                                # Anthropic SDK Usage is a Pydantic model; read attributes
+                                in_tok = int(getattr(usage, "input_tokens", 0) or 0)
+                                out_tok = int(getattr(usage, "output_tokens", 0) or 0)
+                            total_input_tokens += in_tok
+                            total_output_tokens += out_tok
                             try:
-                                # Try to parse and save clean JSON
-                                json.dump(json.loads(json_text_final), out, ensure_ascii=False, indent=2)
-                            except json.JSONDecodeError:
-                                # If parsing fails, write raw text as fallback
-                                out.write(json_text_final)
-                    except Exception as e_write:
-                        logger.error("Failed to write output for %s: %s", filename, e_write)
+                                logger.info("[batch][resume][usage] custom_id=%s in=%s out=%s", custom_id_r, in_tok, out_tok)
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        logger.error("[resume] Failed to parse JSON for %s: %s", custom_id_r, e)
                         update_checkpoint(output_dir, r_row, False, load_checkpoint(output_dir))
                         fail += 1
                         continue
 
-                    # Ingest
-                    ing_ok = True
-                    if not no_ingest:
-                        ing_ok = trigger_ingestion(filepath, logger)
-                    else:
-                        logger.info("Auto-ingest disabled via --no_ingest; skipping ingestion for %s", filepath)
-                    update_checkpoint(output_dir, r_row, ing_ok, load_checkpoint(output_dir))
-                    if ing_ok:
-                        ok += 1
-                    else:
-                        fail += 1
+                # Save output JSON (write raw text directly)
+                try:
+                    with open(filepath, "w", encoding="utf-8") as out:
+                        try:
+                            # Try to parse and save clean JSON
+                            json.dump(json.loads(json_text_final), out, ensure_ascii=False, indent=2)
+                        except json.JSONDecodeError:
+                            # If parsing fails, write raw text as fallback
+                            out.write(json_text_final)
+                except Exception as e_write:
+                    logger.error("[resume] Failed to write output for %s: %s", filename, e_write)
+                    update_checkpoint(output_dir, r_row, False, load_checkpoint(output_dir))
+                    fail += 1
+                    continue
 
-                # Prepare for next round if any still paused
-                resume_queue = next_round
+                # Ingest
+                ing_ok = True
+                if not no_ingest:
+                    ing_ok = trigger_ingestion(filepath, logger)
+                else:
+                    logger.info("Auto-ingest disabled via --no_ingest; skipping ingestion for %s", filepath)
+                update_checkpoint(output_dir, r_row, ing_ok, load_checkpoint(output_dir))
+                if ing_ok:
+                    ok += 1
+                else:
+                    fail += 1
+
+            # Prepare for next round if any still paused
+            resume_queue = next_round
 
         except AnthropicAPIError as e:
             logger.error("Batch API error: %s", e)
@@ -1103,7 +1097,7 @@ def run_batch_generation(
             for row in wave_to_process:
                 update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
             fail += len(wave_to_process)
-
+    
     return ok, fail, total_input_tokens, total_output_tokens
 
 
@@ -1505,13 +1499,11 @@ def resume_pending_batches(
                     
                     text = (parts[-1] if parts else "").strip()
                     try:
-                        # Try to parse JSON directly
                         obj = json.loads(text)
-                    except json.JSONDecodeError:
-                        logger.error("[resume] Failed to parse JSON for %s: %s. Text preview: %s", custom_id, e, text[:200])
-                        update_checkpoint(output_dir, full_row, False, load_checkpoint(output_dir))
-                        fail += 1
-                        continue
+                    except Exception as e:
+                        # Batch-parity: do not fail the row on parse error; save RAW below
+                        logger.warning("[resume] JSON parse failed for %s: %s. Will save RAW text.", custom_id, e)
+                        obj = None
                     
                     # Track usage
                     usage = getattr(message, "usage", None)
@@ -1520,10 +1512,12 @@ def resume_pending_batches(
                             in_tok = int(usage.get("input_tokens", 0) or 0)
                             out_tok = int(usage.get("output_tokens", 0) or 0)
                         else:
+                            # Anthropic SDK Usage is a Pydantic model; read attributes
                             in_tok = int(getattr(usage, "input_tokens", 0) or 0)
                             out_tok = int(getattr(usage, "output_tokens", 0) or 0)
                         total_input_tokens += in_tok
                         total_output_tokens += out_tok
+                        logger.info("[batch][resume][usage] custom_id=%s in=%s out=%s", custom_id, in_tok, out_tok)
                     except Exception:
                         pass
                     
@@ -1533,14 +1527,12 @@ def resume_pending_batches(
                     fail += 1
                     continue
                 
-                # Save output
+                # Save output (parsed JSON if available, else raw text)
                 try:
                     with open(filepath, "w", encoding="utf-8") as out:
-                        try:
-                            # Try to parse and save clean JSON
+                        if obj is not None:
                             json.dump(obj, out, ensure_ascii=False, indent=2)
-                        except json.JSONDecodeError:
-                            # If parsing fails, write raw text as fallback
+                        else:
                             out.write(text)
                 except Exception as e:
                     logger.error("[resume] Failed to write output for %s: %s", filename, e)
@@ -1564,7 +1556,7 @@ def resume_pending_batches(
             # Mark batch as completed
             mark_batch_completed(output_dir, batch_id)
             logger.info("[resume] Batch %s marked as completed", batch_id)
-            
+
             # If we have pause_turn items, submit a follow-up resume batch (mirrors main flow)
             while resume_queue:
                 try:
@@ -1572,6 +1564,7 @@ def resume_pending_batches(
                 except Exception:
                     pass
                 resume_requests: List[Any] = []
+                # Build resume requests
                 for r in resume_queue:
                     custom_id_r = r["custom_id"]
                     row_r = r["row"]
@@ -1609,18 +1602,20 @@ def resume_pending_batches(
                             )
                         )
                     else:
+                        # Fallback compatible with SDK expecting dicts
                         resume_requests.append({"custom_id": custom_id_r, "params": params_r})
-                
+
                 # Submit and process the resume batch
                 try:
                     resume_batch = client.messages.batches.create(requests=resume_requests)
                     resume_batch_id = getattr(resume_batch, "id", None) or resume_batch["id"]  # type: ignore
-                    logger.info("[resume] Resume batch submitted: id=%s", resume_batch_id)
+                    logger.info("Resume batch submitted: id=%s", resume_batch_id)
+                    
                     # Poll until terminal
                     while True:
                         st = client.messages.batches.retrieve(resume_batch_id)
                         st_status = getattr(st, "processing_status", None)
-                        logger.info("[resume] Resume batch %s status: %s", resume_batch_id, st_status)
+                        logger.info("Resume batch %s status: %s", resume_batch_id, st_status)
                         if st_status is None or st_status in ("ended", "completed", "cancelled", "expired", "failed"):
                             break
                         time.sleep(3)
@@ -1641,6 +1636,8 @@ def resume_pending_batches(
                 # Map and process resume results
                 resume_map = {r["custom_id"]: r for r in resume_queue}
                 next_round: List[Dict[str, Any]] = []
+
+                # Process each resume item
                 for item_r in resume_items:
                     custom_id_r = getattr(item_r, "custom_id", None)
                     result_obj_r = getattr(item_r, "result", None)
@@ -1658,8 +1655,8 @@ def resume_pending_batches(
                         continue
                     combined_so_far = prior.get("combined_blocks", [])
                     combined_so_far.extend(_clean_orphan_tool_use(content_blocks_r))
-                    
-                    # Usage accumulation (best-effort)
+
+                    # Usage accumulation
                     usage_r = getattr(message_r, "usage", None)
                     try:
                         if isinstance(usage_r, dict):
@@ -1670,14 +1667,15 @@ def resume_pending_batches(
                             out_tok = int(getattr(usage_r, "output_tokens", 0) or 0)
                         total_input_tokens += in_tok
                         total_output_tokens += out_tok
-                        logger.info("[resume][usage] custom_id=%s in+=%s out+=%s", custom_id_r, in_tok, out_tok)
+                        logger.info("[batch][resume][usage] custom_id=%s in+=%s out+=%s", custom_id_r, in_tok, out_tok)
                     except Exception:
                         pass
                     
-                    # Cache metrics for resume requests (best-effort)
+                # Cache metrics for resume requests (best-effort)
                     try:
                         cache_status_r = None
                         cache_token_credits_r = None
+                        # Probe headers from item_r or message_r
                         headers_r = (
                             getattr(message_r, "response_headers", None)
                             or getattr(message_r, "headers", None)
@@ -1688,13 +1686,16 @@ def resume_pending_batches(
                         if isinstance(headers_r, dict):
                             cache_status_r = headers_r.get("anthropic-cache-status") or headers_r.get("x-anthropic-cache-status")
                             cache_token_credits_r = headers_r.get("anthropic-cache-token-credits")
+                        # Also check usage object
                         if isinstance(usage_r, dict):
                             cache_status_r = cache_status_r or usage_r.get("anthropic-cache-status")
                             cache_token_credits_r = cache_token_credits_r or usage_r.get("anthropic-cache-token-credits")
                         if cache_status_r or cache_token_credits_r:
-                            logger.info("[resume][cache] custom_id=%s status=%s token_credits=%s", custom_id_r, cache_status_r, cache_token_credits_r)
+                            logger.info(
+                                "[batch][resume][cache] custom_id=%s status=%s token_credits=%s", custom_id_r, cache_status_r, cache_token_credits_r
+                            )
                         else:
-                            logger.info("[resume][cache] custom_id=%s status=%s", custom_id_r, None)
+                            logger.info("[batch][resume][cache] custom_id=%s status=%s", custom_id_r, None)
                     except Exception:
                         logger.debug("Failed to read cache headers for resume custom_id=%s", custom_id_r)
                     
@@ -1714,16 +1715,20 @@ def resume_pending_batches(
                     resumed_parts = [b.get("text", "") for b in combined_so_far if isinstance(b, dict) and b.get("type") == "text" and b.get("text")]
                     text_final = ("\n".join(resumed_parts)).strip() if resumed_parts else ""
                     raw_for_parse_r = text_final
+                    # Try to parse JSON; on failure, fall back to writing raw text to keep output file always written
                     try:
                         obj_r = json.loads(raw_for_parse_r)
                     except Exception as e_json:
-                        logger.error("[resume] Failed to parse resumed JSON for %s: %s", custom_id_r, e_json)
-                        update_checkpoint(output_dir, r_row, False, load_checkpoint(output_dir))
-                        fail += 1
-                        continue
+                        logger.warning("[resume] JSON parse failed for %s: %s. Will save RAW text.", custom_id_r, e_json)
+                        obj_r = None
+                    
+                    # Write output (parsed JSON if available, else raw text)
                     try:
                         with open(filepath_r, "w", encoding="utf-8") as out:
-                            json.dump(obj_r, out, ensure_ascii=False, indent=2)
+                            if obj_r is not None:
+                                json.dump(obj_r, out, ensure_ascii=False, indent=2)
+                            else:
+                                out.write(raw_for_parse_r)
                     except Exception as e_write:
                         logger.error("[resume] Failed to write output for %s: %s", filename_r, e_write)
                         update_checkpoint(output_dir, r_row, False, load_checkpoint(output_dir))
@@ -1797,7 +1802,7 @@ def build_user_message(product_row: Dict[str, str], use_natural_generation: bool
 # Anthropic call w/ built-in web search tool
 # ------------------------------
 
-def call_claude_with_web_search(api_key: str, model: str, user_content: str, max_tokens: int = 32000, debug_basepath: str | None = None, system_text: str | None = None, use_cache: bool = True) -> tuple[str, dict]:
+def call_claude_with_web_search(api_key: str, model: str, user_content: str, max_tokens: int = 32000, debug_basepath: str | None = None, system_text: str | None = None, use_cache: bool = True, request_timeout: tuple[int, int] = (30, 1800)) -> tuple[str, dict]:
     """Call Claude API with retry logic and usage tracking."""
     logger = logging.getLogger(__name__)
     
@@ -1820,11 +1825,18 @@ def call_claude_with_web_search(api_key: str, model: str, user_content: str, max
             {
                 "type": "web_search_20250305",
                 "name": "web_search",
-                "max_uses": 5,
+                "max_uses": 10,
             }
         ],
     }
-    
+
+    # Mirror earlier behavior: include thinking block when enabled
+    if ENABLE_THINKING:
+        payload["thinking"] = {
+            "type": "enabled",
+            "budget_tokens": 31999,
+        }
+
     # Inject cacheable system message (prompt caching) if provided
     if system_text:
         # Log a stable hash of the system text to ensure byte-for-byte stability across requests
@@ -1869,7 +1881,7 @@ def call_claude_with_web_search(api_key: str, model: str, user_content: str, max
         start_time = time.time()
         # NOTE: Timeout removed per user request; be aware this may hang indefinitely on network stalls.
         url = ANTHROPIC_API_URL
-        resp = requests.post(url, headers=headers, json=payload)
+        resp = requests.post(url, headers=headers, json=payload, timeout=request_timeout)
         resp.raise_for_status()
         data = resp.json()
 
@@ -2016,6 +2028,99 @@ def _clean_orphan_tool_use(blocks: List[Any]) -> List[Dict[str, Any]]:
 
 
 # ------------------------------
+# OpenAI GPT-5 call w/ web_search and thinking
+# ------------------------------
+
+def call_gpt_with_web_search(
+    api_key: str,
+    model: str,
+    user_content: str,
+    max_tokens: int = 128000,
+    debug_basepath: str | None = None,
+    enable_thinking: bool = True,
+    enable_web_search: bool = True,
+    system_text: str | None = None,
+) -> tuple[str, dict]:
+    """Call OpenAI Responses API with GPT-5 using web_search tool and optional thinking.
+    Returns (raw_text, usage_info_dict).
+    """
+    logger = logging.getLogger(__name__)
+    client = OpenAI(api_key=api_key)
+
+    # Build messages array so we can include the prompt as a system role
+    messages: List[Dict[str, Any]] = []
+    if system_text and system_text.strip():
+        messages.append({"role": "system", "content": system_text})
+    messages.append({"role": "user", "content": user_content})
+
+    kwargs: Dict[str, Any] = {
+        "model": model,
+        "input": messages,
+        "max_output_tokens": max_tokens,
+    }
+    if enable_thinking:
+        kwargs["reasoning"] = {"effort": "high"}
+    # Encourage detailed text output
+    kwargs["text"] = {"verbosity": "high"}
+    if enable_web_search:
+        kwargs["tools"] = [{"type": "web_search"}]
+    kwargs["max_output_tokens"] = max_tokens
+
+    t0 = time.time()
+    resp = client.responses.create(**kwargs)
+    dt = time.time() - t0
+
+    # Extract output text across SDK variants
+    output_text = None
+    try:
+        output_text = getattr(resp, "output_text", None)
+        if not output_text:
+            # Try assembling from outputs list
+            parts = []
+            for item in getattr(resp, "output", []) or []:
+                txt = getattr(item, "content", None) or getattr(item, "text", None)
+                if isinstance(txt, str):
+                    parts.append(txt)
+            if parts:
+                output_text = "\n".join(parts)
+    except Exception:
+        output_text = None
+
+    raw_text = (output_text or "").strip()
+
+    # Usage best-effort extraction
+    usage_info: Dict[str, Any] = {}
+    try:
+        usage = getattr(resp, "usage", None)
+        if isinstance(usage, dict):
+            usage_info["input_tokens"] = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
+            usage_info["output_tokens"] = usage.get("output_tokens") or usage.get("completion_tokens") or 0
+        else:
+            usage_info["input_tokens"] = getattr(usage, "input_tokens", None) or getattr(usage, "prompt_tokens", 0) or 0
+            usage_info["output_tokens"] = getattr(usage, "output_tokens", None) or getattr(usage, "completion_tokens", 0) or 0
+    except Exception:
+        usage_info.setdefault("input_tokens", 0)
+        usage_info.setdefault("output_tokens", 0)
+
+    # Optional debug sidecars
+    if debug_basepath:
+        try:
+            with open(f"{debug_basepath}_response_text.txt", "w", encoding="utf-8") as f_raw:
+                f_raw.write(raw_text)
+            with open(f"{debug_basepath}_response_usage.json", "w", encoding="utf-8") as f_usage:
+                json.dump(usage_info, f_usage, ensure_ascii=False, indent=2)
+        except Exception:
+            logger.debug("Failed writing GPT debug sidecars for %s", debug_basepath)
+
+    try:
+        logger.info("GPT Response <- time=%.2fs usage=%s", dt, usage_info)
+    except Exception:
+        pass
+
+    return raw_text, usage_info
+
+
+# ------------------------------
 # Main
 # ------------------------------
 
@@ -2026,12 +2131,17 @@ def main() -> None:
     parser.add_argument("--no_ingest", action="store_true", help="Disable automatic Pinecone ingestion after writing each JSON output")
     # Batch is ON by default. Use --no_batch to fall back to synchronous single-request mode.
     parser.add_argument("--no_batch", action="store_true", help="Disable Anthropic Message Batches API and use synchronous requests")
-    parser.add_argument("--no_sidecars", action="store_true", help="Do not write raw/audit sidecar files alongside the main JSON output")
     parser.add_argument("--no_cache", action="store_true", help="Disable Anthropic prompt caching (use for token price comparison)")
     parser.add_argument("--resume_batches", action="store_true", help="Resume processing of pending batches that timed out during polling")
     args, unknown = parser.parse_known_args()
+    # Log received CLI for diagnostics
+    try:
+        logging.getLogger(__name__).info("CLI argv: %s", " ".join(sys.argv))
+        logging.getLogger(__name__).info("Parsed flags: no_batch=%s, no_ingest=%s, no_cache=%s, resume_batches=%s", args.no_batch, args.no_ingest, args.no_cache, args.resume_batches)
+    except Exception:
+        pass
     # Hardcoded file paths
-    prompt_path = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/data/beauty_prompt_consolidated (7).json"
+    prompt_path = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/data/beauty_prompt_restored.json"
     
     # Data source selection based on USE_EXCEL_DATA parameter
     if USE_EXCEL_DATA:
@@ -2080,12 +2190,31 @@ def main() -> None:
     else:
         logger.info("📋 Starting fresh - no previous checkpoint found")
 
-    # Select and validate API key
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        logger.error("ANTHROPIC_API_KEY is not set")
+    # Select provider and validate API keys
+    provider = None
+    if USE_GPT and USE_CLAUDE:
+        provider = "claude"  # Prefer Claude when both are enabled
+        logger.warning("Both USE_GPT and USE_CLAUDE are True; defaulting to Claude. Set USE_CLAUDE=False to use GPT.")
+    elif USE_GPT:
+        provider = "gpt"
+    elif USE_CLAUDE:
+        provider = "claude"
+    else:
+        logger.error("No provider enabled. Set USE_GPT=True or USE_CLAUDE=True.")
         sys.exit(2)
 
+    anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+
+    if provider == "claude":
+        if not anthropic_api_key:
+            logger.error("ANTHROPIC_API_KEY is not set")
+            sys.exit(2)
+    else:
+        if not openai_api_key:
+            logger.error("OPENAI_API_KEY is not set for GPT provider")
+            sys.exit(2)
+    
     os.makedirs(output_dir, exist_ok=True)
     logger.info(f"Output directory: {output_dir}")
     # Determine caching behavior
@@ -2099,6 +2228,9 @@ def main() -> None:
 
     # RESUME MODE: If --resume_batches is passed, process pending batches and exit
     if args.resume_batches:
+        if provider != "claude":
+            logger.info("Resume batches is only applicable to Claude batch runs. GPT provider selected; nothing to resume.")
+            sys.exit(0)
         logger.info("🔄 RESUME MODE: Processing pending batches...")
         logger.info("="*60)
         
@@ -2113,7 +2245,7 @@ def main() -> None:
         # Call resume function
         resume_start = time.time()
         ok, fail, in_tok, out_tok = resume_pending_batches(
-            api_key=api_key,
+            api_key=anthropic_api_key,
             model=model,
             prompt_text=prompt_text,
             max_tokens=max_tokens,
@@ -2187,11 +2319,11 @@ def main() -> None:
 
 
     # Batch mode: use Anthropic Message Batches API
-    if not args.no_batch:
+    if provider == "claude" and not args.no_batch:
         batch_size = BATCH_SIZE_DEFAULT
         logger.info("Running in BATCH mode (default): batch_size=%s", batch_size)
         ok, fail, batch_in_tokens, batch_out_tokens = run_batch_generation(
-            api_key=api_key,
+            api_key=anthropic_api_key,
             model=model,
             rows=remaining_rows,
             prompt_text=prompt_text,
@@ -2271,216 +2403,211 @@ def main() -> None:
                 logger.info("Auto-ingest disabled via --no_ingest; marking existing file as completed: %s", filename)
             continue
         
-        # Compute per-product debug base path early (needed in reprocessing block below)
+        # Compute per-product debug base path early 
         debug_basepath = None
         if debug_root:
             base_no_ext = os.path.splitext(filename)[0]
             debug_basepath = os.path.join(debug_root, base_no_ext)
 
-        # Reprocessing path: if a raw sidecar exists from a previous failed attempt, try to recover without calling the LLM
-        try:
-            base_no_ext = os.path.splitext(filename)[0]
-            raw_sidecar_path = os.path.join(output_dir, f"{base_no_ext}.raw.json")
-            if os.path.exists(raw_sidecar_path):
-                logger.info("Found raw sidecar for %s; attempting reprocess without LLM: %s", filename, raw_sidecar_path)
-                try:
-                    with open(raw_sidecar_path, "r", encoding="utf-8") as f_raw_in:
-                        sidecar = json.load(f_raw_in)
-                    raw_text = sidecar.get("raw_text", "")
-                except Exception as _e:
-                    raw_text = ""
-                    logger.warning("Failed to read sidecar file %s: %s", raw_sidecar_path, _e)
-
-                if raw_text:
-                    # Try to extract and parse JSON from the saved raw LLM text
-                    recovered = raw_text
-                    try:
-                        obj = json.loads(recovered)
-                        # Save file
-                        with open(filepath, "w", encoding="utf-8") as out:
-                            try:
-                                # Try to parse and save clean JSON
-                                json.dump(obj, out, ensure_ascii=False, indent=2)
-                            except json.JSONDecodeError:
-                                # If parsing fails, write raw text as fallback
-                                out.write(raw_text)
-
-                        # Optionally write parsed JSON as well
-                        if debug_basepath:
-                            try:
-                                with open(f"{debug_basepath}_parsed.json", "w", encoding="utf-8") as f_parsed:
-                                    json.dump(obj, f_parsed, ensure_ascii=False, indent=2)
-                            except Exception:
-                                logger.debug("Failed to write parsed JSON for %s", debug_basepath)
-
-                        # Trigger ingestion
-                        ing_ok = True
-                        if not args.no_ingest:
-                            ing_ok = trigger_ingestion(filepath, logger)
-                        else:
-                            logger.info("Auto-ingest disabled via --no_ingest; skipping ingestion for %s", filepath)
-
-                        # Update checkpoint and continue to next product
-                        update_checkpoint(output_dir, row, ing_ok, load_checkpoint(output_dir))
-                        if not ing_ok:
-                            logger.warning("Marked as failed due to ingestion failure (reprocessed): %s", filename)
-                        logger.info("✓ Row %s (reprocessed): SUCCESS -> %s", idx, filename)
-                        continue
-                    except json.JSONDecodeError:
-                        logger.info("Reprocess failed to parse sidecar raw_text; proceeding to call LLM for %s", filename)
-                else:
-                    logger.info("Sidecar present but no raw_text found; proceeding to call LLM for %s", filename)
-        except Exception as _e:
-            logger.warning("Unexpected error during sidecar reprocessing path for %s: %s", filename, _e)
-
-        system_text, user_msg = build_user_message(row, use_natural_generation=True)
+        # Build user message for this row. We intentionally ignore the returned system_text (empty)
+        # and pass prompt_text as the system message so sync path mirrors batch behavior.
+        _, user_msg = build_user_message(row, use_natural_generation=True)
         
-        try:
-            raw, usage_info = call_claude_with_web_search(
-                api_key,
-                model,
-                user_msg,
-                max_tokens=max_tokens,
-                debug_basepath=debug_basepath,
-                system_text=system_text,
-                use_cache=use_prompt_cache,
-            )
-
-            # Pre-clean: many providers wrap JSON in ```json fences; extract first JSON block if present
-            raw_for_parse = raw
-
+        if provider == "claude":
             try:
-                obj = json.loads(raw_for_parse)
-            except json.JSONDecodeError:
-                # Attempt to extract JSON object if assistant added prose before/after
-                cleaned = raw
-                if cleaned is None:
-                    raise
-                # Optionally write the cleaned JSON to debug
+                raw, usage_info = call_claude_with_web_search(
+                    anthropic_api_key,
+                    model,
+                    user_msg,
+                    max_tokens=max_tokens,
+                    debug_basepath=debug_basepath,
+                    system_text=prompt_text,
+                    use_cache=use_prompt_cache,
+                    request_timeout=(30, 1800),
+                )
+
+                # Pre-clean: many providers wrap JSON in ```json fences; extract first JSON block if present
+                raw_for_parse = raw
+
+                try:
+                    obj = json.loads(raw_for_parse)
+                except Exception:
+                    # If parsing fails for any reason, save RAW to main file (batch-parity behavior)
+                    obj = None
+
+                # Save main product file (parsed JSON if available, else raw text)
+                with open(filepath, "w", encoding="utf-8") as out:
+                    if obj is not None:
+                        json.dump(obj, out, ensure_ascii=False, indent=2)
+                    else:
+                        out.write(raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False, indent=2))
+
+                # Trigger ingestion
+                ing_ok = True
+                if not args.no_ingest:
+                    ing_ok = trigger_ingestion(filepath, logger)
+                else:
+                    logger.info("Auto-ingest disabled via --no_ingest; skipping ingestion for %s", filepath)
+                 
+                product_time = time.time() - product_start_time
+                session_ok += 1
+                
+                # Update checkpoint
+                update_checkpoint(output_dir, row, ing_ok, load_checkpoint(output_dir))
+                if not ing_ok:
+                    logger.warning("Marked as failed due to ingestion failure: %s", filename)
+                
+                logger.info(f"✓ Row {idx}: SUCCESS -> {filename} (Time: {product_time:.2f}s, Tokens: {input_tokens}→{output_tokens})")
+                
+            except requests.HTTPError as http_e:
+                logger.error(f"✗ Row {idx}: HTTP error: {http_e}")
+                # Debug error already written inside call if last attempt failed
+                session_fail += 1
+                update_checkpoint(output_dir, row, False, checkpoint_data)
+                continue
+            except Exception as e:
+                logger.error(f"✗ Row {idx}: Unexpected error: {e}")
                 if debug_basepath:
                     try:
-                        with open(f"{debug_basepath}_response_text.cleaned.json", "w", encoding="utf-8") as f_clean:
-                            f_clean.write(cleaned)
+                        with open(f"{debug_basepath}_unexpected_error.txt", "w", encoding="utf-8") as f_uerr:
+                            f_uerr.write(str(e))
                     except Exception:
-                        logger.debug("Failed to write cleaned JSON for %s", debug_basepath)
-                obj = json.loads(cleaned)
-            
-            # Track token usage
-            input_tokens = usage_info.get("input_tokens", 0)
-            output_tokens = usage_info.get("output_tokens", 0)
-            total_input_tokens += input_tokens
-            total_output_tokens += output_tokens
-            
-            # Save file
-            with open(filepath, "w", encoding="utf-8") as out:
-                try:
-                    # Try to parse and save clean JSON
-                    json.dump(obj, out, ensure_ascii=False, indent=2)
-                except json.JSONDecodeError:
-                    # If parsing fails, write raw text as fallback
-                    out.write(raw)
+                        logger.debug("Failed to write unexpected error file for %s", debug_basepath)
+                session_fail += 1
+                update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
+                continue
+        elif provider == "gpt":
+            try:
+                raw, usage_info = call_gpt_with_web_search(
+                    openai_api_key,
+                    "gpt-5",
+                    user_msg,
+                    max_tokens=128000,
+                    debug_basepath=debug_basepath,
+                    enable_thinking=ENABLE_THINKING,
+                    enable_web_search=True,
+                    system_text=prompt_text,
+                )
 
-            # Optionally write raw-response and/or audit file (disabled by default)
-            if WRITE_RAW_FULL or WRITE_AUDIT_FILES:
+                # Pre-clean: many providers wrap JSON in ```json fences; extract first JSON block if present
+                raw_for_parse = raw
+
+                try:
+                    obj = json.loads(raw_for_parse)
+                except Exception as e:
+                    # Attempt to extract JSON object if assistant added prose before/after
+                    cleaned = raw
+                    if cleaned is None:
+                        raise
+                    # Optionally write the cleaned JSON to debug
+                    if debug_basepath:
+                        try:
+                            with open(f"{debug_basepath}_response_text.cleaned.json", "w", encoding="utf-8") as f_clean:
+                                f_clean.write(cleaned)
+                        except Exception:
+                            logger.debug("Failed to write cleaned JSON for %s", debug_basepath)
+                    obj = json.loads(cleaned)
+                
+                # Track usage
+                input_tokens = usage_info.get("input_tokens", 0)
+                output_tokens = usage_info.get("output_tokens", 0)
+                total_input_tokens += input_tokens
+                total_output_tokens += output_tokens
+                
+                # Save file
+                with open(filepath, "w", encoding="utf-8") as out:
+                    try:
+                        # Try to parse and save clean JSON
+                        json.dump(obj, out, ensure_ascii=False, indent=2)
+                    except json.JSONDecodeError:
+                        # If parsing fails, write raw text as fallback
+                        out.write(raw)
+
+                # Always write a raw sidecar like batch mode (<base>.raw.result.txt)
                 try:
                     base_no_ext = os.path.splitext(filename)[0]
-                    if WRITE_RAW_FULL:
-                        # Full raw text from the LLM
-                        raw_full_txt_path = os.path.join(output_dir, f"{base_no_ext}.raw.full.txt")
-                        with open(raw_full_txt_path, "w", encoding="utf-8") as f_raw_full:
-                            f_raw_full.write(raw)
-                    if WRITE_AUDIT_FILES:
-                        # Audit JSON comparing raw chars vs parsed JSON chars
-                        parsed_json_str = json.dumps(obj, ensure_ascii=False)
-                        audit = {
-                            "filename": filename,
-                            "raw_chars": len(raw or ""),
-                            "parsed_json_chars": len(parsed_json_str),
-                            "dropped_chars": max(len(raw or "") - len(parsed_json_str), 0),
-                            "timestamp": datetime.now().isoformat(),
-                        }
-                        audit_path = os.path.join(output_dir, f"{base_no_ext}.audit.json")
-                        with open(audit_path, "w", encoding="utf-8") as f_audit:
-                            json.dump(audit, f_audit, ensure_ascii=False, indent=2)
+                    raw_result_txt_path = os.path.join(output_dir, f"{base_no_ext}.raw.result.txt")
+                    with open(raw_result_txt_path, "w", encoding="utf-8") as f_rawtxt:
+                        f_rawtxt.write(raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False, indent=2))
                 except Exception as _e:
-                    logger.debug("Failed to write optional raw/audit files for %s: %s", filename, _e)
+                    logger.debug("Failed to write raw result text sidecar for %s: %s", filename, _e)
 
-            # Optional debug: save parsed JSON as well (duplicate of output for quick diff)
-            if debug_basepath:
-                try:
-                    with open(f"{debug_basepath}_parsed.json", "w", encoding="utf-8") as f_parsed:
-                        json.dump(obj, f_parsed, ensure_ascii=False, indent=2)
-                except Exception:
-                    logger.debug("Failed to write parsed JSON for %s", debug_basepath)
+                # Optional debug: save parsed JSON as well (duplicate of output for quick diff)
+                if debug_basepath:
+                    try:
+                        with open(f"{debug_basepath}_parsed.json", "w", encoding="utf-8") as f_parsed:
+                            json.dump(obj, f_parsed, ensure_ascii=False, indent=2)
+                    except Exception:
+                        logger.debug("Failed to write parsed JSON for %s", debug_basepath)
 
-            # Trigger ingestion
-            ing_ok = True
-            if not args.no_ingest:
-                ing_ok = trigger_ingestion(filepath, logger)
-            else:
-                logger.info("Auto-ingest disabled via --no_ingest; skipping ingestion for %s", filepath)
-             
-            product_time = time.time() - product_start_time
-            session_ok += 1
-            
-            # Update checkpoint
-            update_checkpoint(output_dir, row, ing_ok, load_checkpoint(output_dir))
-            if not ing_ok:
-                logger.warning("Marked as failed due to ingestion failure: %s", filename)
-            
-            logger.info(f"✓ Row {idx}: SUCCESS -> {filename} (Time: {product_time:.2f}s, Tokens: {input_tokens}→{output_tokens})")
-            
-        except requests.HTTPError as http_e:
-            logger.error(f"✗ Row {idx}: HTTP error: {http_e}")
-            # Debug error already written inside call if last attempt failed
-            session_fail += 1
-            update_checkpoint(output_dir, row, False, checkpoint_data)
-            continue
-        except json.JSONDecodeError as jd:
-            logger.error(f"✗ Row {idx}: JSON decode error: {jd}")
-            logger.debug(f"Raw response: {raw[:500]}...")
-            # Persist raw LLM output to a sidecar file so we don't lose the response
-            try:
-                base_no_ext = os.path.splitext(filename)[0]
-                raw_sidecar_path = os.path.join(output_dir, f"{base_no_ext}.raw.json")
-                sidecar_payload = {
-                    "raw_text": raw,
-                    "error": str(jd),
-                    "model": model,
-                    "product": {
-                        "brand": row.get("brand", ""),
-                        "product_name": row.get("product_name", ""),
-                        "shade_of_lipstick": row.get("shade_of_lipstick", ""),
-                        "sku": row.get("sku", "")
-                    },
-                    "timestamp": datetime.now().isoformat()
-                }
-                with open(raw_sidecar_path, "w", encoding="utf-8") as f_raw_out:
-                    json.dump(sidecar_payload, f_raw_out, ensure_ascii=False, indent=2)
-                logger.info("Saved raw LLM output to %s", raw_sidecar_path)
-            except Exception as _e:
-                logger.warning("Failed to save raw sidecar file: %s", _e)
-            if debug_basepath:
+                # Trigger ingestion
+                ing_ok = True
+                if not args.no_ingest:
+                    ing_ok = trigger_ingestion(filepath, logger)
+                else:
+                    logger.info("Auto-ingest disabled via --no_ingest; skipping ingestion for %s", filepath)
+                 
+                product_time = time.time() - product_start_time
+                session_ok += 1
+                
+                # Update checkpoint
+                update_checkpoint(output_dir, row, ing_ok, load_checkpoint(output_dir))
+                if not ing_ok:
+                    logger.warning("Marked as failed due to ingestion failure: %s", filename)
+                
+                logger.info(f"✓ Row {idx}: SUCCESS -> {filename} (Time: {product_time:.2f}s, Tokens: {input_tokens}→{output_tokens})")
+                
+            except requests.HTTPError as http_e:
+                logger.error(f"✗ Row {idx}: HTTP error: {http_e}")
+                # Debug error already written inside call if last attempt failed
+                session_fail += 1
+                update_checkpoint(output_dir, row, False, checkpoint_data)
+                continue
+            except json.JSONDecodeError as jd:
+                logger.error(f"✗ Row {idx}: JSON decode error: {jd}")
+                logger.debug(f"Raw response: {raw[:500]}...")
+                # Persist raw LLM output to a sidecar file so we don't lose the response
                 try:
-                    with open(f"{debug_basepath}_json_error.txt", "w", encoding="utf-8") as f_jerr:
-                        f_jerr.write(str(jd) + "\n\n")
-                        f_jerr.write(raw)
-                except Exception:
-                    logger.debug("Failed to write JSON error file for %s", debug_basepath)
-            session_fail += 1
-            update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
-            continue
-        except Exception as e:
-            logger.error(f"✗ Row {idx}: Unexpected error: {e}")
-            if debug_basepath:
-                try:
-                    with open(f"{debug_basepath}_unexpected_error.txt", "w", encoding="utf-8") as f_uerr:
-                        f_uerr.write(str(e))
-                except Exception:
-                    logger.debug("Failed to write unexpected error file for %s", debug_basepath)
-            session_fail += 1
-            update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
-            continue
+                    base_no_ext = os.path.splitext(filename)[0]
+                    raw_sidecar_path = os.path.join(output_dir, f"{base_no_ext}.raw.json")
+                    sidecar_payload = {
+                        "raw_text": raw,
+                        "error": str(jd),
+                        "model": model,
+                        "product": {
+                            "brand": row.get("brand", ""),
+                            "product_name": row.get("product_name", ""),
+                            "shade_of_lipstick": row.get("shade_of_lipstick", ""),
+                            "sku": row.get("sku", "")
+                        },
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    with open(raw_sidecar_path, "w", encoding="utf-8") as f_raw_out:
+                        json.dump(sidecar_payload, f_raw_out, ensure_ascii=False, indent=2)
+                    logger.info("Saved raw LLM output to %s", raw_sidecar_path)
+                except Exception as _:
+                    logger.debug("Failed to save raw sidecar file: %s", _)
+                if debug_basepath:
+                    try:
+                        with open(f"{debug_basepath}_json_error.txt", "w", encoding="utf-8") as f_jerr:
+                            f_jerr.write(str(jd) + "\n\n")
+                            f_jerr.write(raw)
+                    except Exception:
+                        logger.debug("Failed to write JSON error file for %s", debug_basepath)
+                session_fail += 1
+                update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
+                continue
+            except Exception as e:
+                logger.error(f"✗ Row {idx}: Unexpected error: {e}")
+                if debug_basepath:
+                    try:
+                        with open(f"{debug_basepath}_unexpected_error.txt", "w", encoding="utf-8") as f_uerr:
+                            f_uerr.write(str(e))
+                    except Exception:
+                        logger.debug("Failed to write unexpected error file for %s", debug_basepath)
+                session_fail += 1
+                update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
+                continue
 
     # Final statistics
     total_time = time.time() - start_time

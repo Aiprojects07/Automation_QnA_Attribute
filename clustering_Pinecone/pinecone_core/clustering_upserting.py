@@ -330,6 +330,53 @@ def build_records_from_report(data: Dict[str, Any], source_name: str) -> Tuple[L
         pass
 
     sections = data.get("sections") or []
+    # Capture optional root-level analysis note and total sections
+    total_sections = len(sections)
+    # Support multiple locations and casings for the analysis note across different JSON schemas
+    _meta_raw = data.get("metadata")
+    _meta = _meta_raw if isinstance(_meta_raw, dict) else {}
+    # If metadata is a plain string, treat it as a candidate note value
+    _meta_str = ensure_str(_meta_raw).strip() if isinstance(_meta_raw, (str, int, float)) else ""
+    analysis_note = ensure_str(
+        data.get("analysisNote")
+        or data.get("analysis_note")
+        or data.get("Note")
+        or data.get("note")
+        or data.get("ending_note")
+        or data.get("endingNote")
+        or data.get("endNote")
+        or data.get("end_note")
+        or data.get("finalNote")
+        or data.get("final_note")
+        or data.get("additionalNote")
+        or data.get("additional_note")
+        or data.get("globalNote")
+        or data.get("global_note")
+        or data.get("reportNote")
+        or data.get("report_note")
+        or data.get("mandatory_report_ending")
+        or data.get("mandatoryReportEnding")
+        or _meta.get("analysisNote")
+        or _meta.get("analysis_note")
+        or _meta.get("note")
+        or _meta.get("Note")
+        or _meta.get("ending_note")
+        or _meta.get("endingNote")
+        or _meta.get("endNote")
+        or _meta.get("end_note")
+        or _meta.get("finalNote")
+        or _meta.get("final_note")
+        or _meta.get("additionalNote")
+        or _meta.get("additional_note")
+        or _meta.get("globalNote")
+        or _meta.get("global_note")
+        or _meta.get("reportNote")
+        or _meta.get("report_note")
+        or _meta.get("mandatory_report_ending")
+        or _meta.get("mandatoryReportEnding")
+        or _meta_str
+        or ""
+    ).strip()
     for s_idx, sec in enumerate(sections):
         section_parts: List[str] = []
         title = ensure_str(sec.get("title")).strip()
@@ -352,15 +399,43 @@ def build_records_from_report(data: Dict[str, Any], source_name: str) -> Tuple[L
             else:
                 section_parts.append(ensure_str(content).strip())
 
+        # New: Include optional 'format' field (string or dict) in section content
+        try:
+            if "format" in sec:
+                fmt = sec.get("format")
+                if isinstance(fmt, dict):
+                    for k, v in fmt.items():
+                        key_hdr = ensure_str(k).strip()
+                        if isinstance(v, list):
+                            vals = [ensure_str(x).strip() for x in v if ensure_str(x).strip()]
+                            if vals:
+                                section_parts.append(f"{key_hdr}:\n" + "\n".join([f"- {x}" for x in vals]))
+                        else:
+                            val_txt = ensure_str(v).strip()
+                            if val_txt:
+                                section_parts.append(f"{key_hdr}: {val_txt}")
+                else:
+                    fmt_txt = ensure_str(fmt).strip()
+                    if fmt_txt:
+                        section_parts.append(fmt_txt)
+        except Exception:
+            pass
+
         # Include PROS and CONS arrays when present
         try:
-            # Helper for case-insensitive key lookup
+            # Helper for case-insensitive, format-normalized key lookup
             def _get_ci(d, keys):
                 if not isinstance(d, dict):
                     return None
-                lower_map = {str(k).strip().lower(): v for k, v in d.items()}
+                def _norm(s: str) -> str:
+                    s = str(s).strip().lower()
+                    # Replace any non-alphanumeric with underscore and collapse repeats
+                    s = re.sub(r"[^a-z0-9]+", "_", s)
+                    s = re.sub(r"_+", "_", s).strip("_")
+                    return s
+                norm_map = {_norm(k): v for k, v in d.items()}
                 for name in keys:
-                    v = lower_map.get(name.lower())
+                    v = norm_map.get(_norm(name))
                     if v is not None:
                         return v
                 return None
@@ -375,6 +450,83 @@ def build_records_from_report(data: Dict[str, Any], source_name: str) -> Tuple[L
                 pros = _get_ci(content_obj, ["PROS", "pros"]) or pros
             if (not cons or not isinstance(cons, list)) and isinstance(content_obj, dict):
                 cons = _get_ci(content_obj, ["CONS", "cons"]) or cons
+
+            # New: Fallback when PROS/CONS live under a 'structure' object at section root
+            struct_obj = sec.get("structure")
+            if (not pros or not isinstance(pros, list)) and isinstance(struct_obj, dict):
+                cand = _get_ci(struct_obj, ["PROS", "pros"]) or []
+                pros = cand if cand else pros
+            if (not cons or not isinstance(cons, list)) and isinstance(struct_obj, dict):
+                cand = _get_ci(struct_obj, ["CONS", "cons"]) or []
+                cons = cand if cand else cons
+
+            # New: Fallback when PROS/CONS live under content.structure
+            if isinstance(content_obj, dict):
+                inner_struct = _get_ci(content_obj, ["structure"]) if isinstance(content_obj, dict) else None
+                if isinstance(inner_struct, dict):
+                    if (not pros or not isinstance(pros, list)):
+                        cand = _get_ci(inner_struct, ["PROS", "pros"]) or []
+                        pros = cand if cand else pros
+                    if (not cons or not isinstance(cons, list)):
+                        cand = _get_ci(inner_struct, ["CONS", "cons"]) or []
+                        cons = cand if cand else cons
+
+            # New: Fallback when PROS/CONS live under a 'format' field (dict or string)
+            fmt_obj = sec.get("format")
+            if (not pros or not isinstance(pros, list)) and isinstance(fmt_obj, dict):
+                cand = _get_ci(fmt_obj, ["PROS", "pros"]) or []
+                pros = cand if cand else pros
+            if (not cons or not isinstance(cons, list)) and isinstance(fmt_obj, dict):
+                cand = _get_ci(fmt_obj, ["CONS", "cons"]) or []
+                cons = cand if cand else cons
+            # Parse PROS/CONS from format string blocks
+            if (not (isinstance(pros, list) and pros) or not (isinstance(cons, list) and cons)) and isinstance(fmt_obj, str):
+                try:
+                    text_fmt = ensure_str(fmt_obj)
+                    # Extract PROS block (flags consolidated at start to avoid deprecation warning)
+                    if not (isinstance(pros, list) and pros):
+                        m_pros = re.search(r"(?is)\bPROS\s*:\s*(.*?)(?:\n\s*CONS\s*:\s*|$)", text_fmt)
+                        if m_pros:
+                            block = m_pros.group(1)
+                            cand_lines = [ln.strip().lstrip("-+•✓ ") for ln in (block or "").splitlines() if ln.strip()]
+                            if cand_lines:
+                                pros = cand_lines
+                    # Extract CONS block
+                    if not (isinstance(cons, list) and cons):
+                        # Look for CONS: ... until next blank line or USER CONSENSUS SUMMARY
+                        m_cons = re.search(r"(?is)\bCONS\s*:\s*(.*?)(?:\n\s*USER\s+CONSENSUS\s+SUMMARY\s*:|\Z)", text_fmt)
+                        if m_cons:
+                            block = m_cons.group(1)
+                            cand_lines = [ln.strip().lstrip("-+•✗x ") for ln in (block or "").splitlines() if ln.strip()]
+                            if cand_lines:
+                                cons = cand_lines
+                except Exception:
+                    pass
+
+            # New: Fallback when PROS/CONS live under section.qas items
+            if (not pros or not isinstance(pros, list)) or (not cons or not isinstance(cons, list)):
+                qas_list = sec.get("qas") or []
+                collected_pros = []
+                collected_cons = []
+                for qa_item in qas_list:
+                    if isinstance(qa_item, dict):
+                        # Collect PROS
+                        qa_pros = _get_ci(qa_item, ["PROS", "pros"]) or []
+                        if isinstance(qa_pros, list):
+                            collected_pros.extend([ensure_str(x).strip() for x in qa_pros if ensure_str(x).strip()])
+                        elif isinstance(qa_pros, str) and qa_pros.strip():
+                            collected_pros.extend([p.strip().lstrip("-+•✓ ") for p in qa_pros.splitlines() if p.strip()])
+                        # Collect CONS
+                        qa_cons = _get_ci(qa_item, ["CONS", "cons"]) or []
+                        if isinstance(qa_cons, list):
+                            collected_cons.extend([ensure_str(x).strip() for x in qa_cons if ensure_str(x).strip()])
+                        elif isinstance(qa_cons, str) and qa_cons.strip():
+                            collected_cons.extend([c.strip().lstrip("-+•✗x ") for c in qa_cons.splitlines() if c.strip()])
+
+                if not (isinstance(pros, list) and pros):
+                    pros = collected_pros
+                if not (isinstance(cons, list) and cons):
+                    cons = collected_cons
 
             # If string instead of list, split into lines
             if isinstance(pros, str):
@@ -398,9 +550,53 @@ def build_records_from_report(data: Dict[str, Any], source_name: str) -> Tuple[L
             # best-effort; continue if formatting fails
             pass
 
-        # Include USER_CONSENSUS_SUMMARY when present
+        # Include USER_CONSENSUS_SUMMARY when present (supports multiple locations)
         try:
-            consensus = ensure_str(sec.get("USER_CONSENSUS_SUMMARY") or sec.get("user_consensus_summary")).strip()
+            # Try at section root (case-insensitive)
+            consensus_val = _get_ci(sec, ["USER_CONSENSUS_SUMMARY", "user_consensus_summary", "userConsensusSummary"])  # type: ignore[name-defined]
+            # Fallback: inside section.content if it's a dict
+            if not consensus_val and isinstance(sec.get("content"), dict):
+                consensus_val = _get_ci(sec.get("content"), ["USER_CONSENSUS_SUMMARY", "user_consensus_summary", "userConsensusSummary"])  # type: ignore[name-defined]
+
+            # New: Fallback: section.structure
+            if not consensus_val and isinstance(sec.get("structure"), dict):
+                consensus_val = _get_ci(sec.get("structure"), ["USER_CONSENSUS_SUMMARY", "user_consensus_summary", "userConsensusSummary"])  # type: ignore[name-defined]
+
+            # New: Fallback: content.structure
+            _cobj = sec.get("content")
+            if not consensus_val and isinstance(_cobj, dict):
+                inner_struct = _get_ci(_cobj, ["structure"])  # type: ignore[name-defined]
+                if isinstance(inner_struct, dict):
+                    consensus_val = _get_ci(inner_struct, ["USER_CONSENSUS_SUMMARY", "user_consensus_summary", "userConsensusSummary"])  # type: ignore[name-defined]
+
+            # New: Fallback: section.format dict
+            if not consensus_val and isinstance(sec.get("format"), dict):
+                consensus_val = _get_ci(sec.get("format"), ["USER_CONSENSUS_SUMMARY", "user_consensus_summary", "userConsensusSummary"])  # type: ignore[name-defined]
+
+            # New: Parse from format string if present
+            if not consensus_val and isinstance(sec.get("format"), str):
+                fmt_txt = ensure_str(sec.get("format"))
+                try:
+                    m = re.search(r"(?is)\bUSER\s+CONSENSUS\s+SUMMARY\s*:\s*(.*)$", fmt_txt)
+                    if m:
+                        consensus_val = m.group(1).strip()
+                except Exception:
+                    pass
+
+            # New: fallback inside section.qas items
+            if not consensus_val:
+                for qa_item in (sec.get("qas") or []):
+                    if isinstance(qa_item, dict):
+                        c = _get_ci(qa_item, ["USER_CONSENSUS_SUMMARY", "user_consensus_summary", "userConsensusSummary"])  # type: ignore[name-defined]
+                        if c:
+                            consensus_val = c
+                            break
+
+            # Normalize consensus to a string (robust for any type)
+            consensus = ensure_str(consensus_val).strip()
+            if not consensus and isinstance(consensus_val, list):
+                consensus = " ".join([ensure_str(x).strip() for x in consensus_val if ensure_str(x).strip()])
+
             if consensus:
                 section_parts.append(f"USER CONSENSUS: {consensus}")
         except Exception:
@@ -411,16 +607,56 @@ def build_records_from_report(data: Dict[str, Any], source_name: str) -> Tuple[L
             a = ensure_str(qa.get("a")).strip()
             why = ensure_str(qa.get("why")).strip()
             sol = ensure_str(qa.get("solution")).strip()
-            # New: include per-QA confidence score/text when present
-            conf = ensure_str(qa.get("CONFIDENCE") or qa.get("confidence")).strip()
             qa_block = [
                 f"Q{q_idx+1}: {q}" if q else "",
                 f"A: {a}" if a else "",
                 f"WHY: {why}" if why else "",
                 f"SOLUTION: {sol}" if sol else "",
-                f"CONFIDENCE: {conf}" if conf else "",
             ]
-            section_parts.append("\n".join([p for p in qa_block if p]))
+            qb = "\n".join([p for p in qa_block if p])
+            if qb:
+                section_parts.append(qb)
+
+            # Also ingest any additional structured fields present in this qa (e.g., ingredients, safety, etc.)
+            try:
+                if isinstance(qa, dict):
+                    skip_keys = {"q", "a", "why", "solution", "PROS", "pros", "CONS", "cons", "USER_CONSENSUS_SUMMARY", "user_consensus_summary"}
+                    for k, v in qa.items():
+                        if k in skip_keys:
+                            continue
+                        key_hdr = ensure_str(k).strip()
+                        if not key_hdr:
+                            continue
+                        # Dict -> flatten into bullet lines
+                        if isinstance(v, dict):
+                            lines = []
+                            try:
+                                lines_text = flatten_snapshot(v)
+                                lines = [ensure_str(ln).strip() for ln in ensure_str(lines_text).splitlines() if ensure_str(ln).strip()]
+                            except Exception:
+                                # simple fallback
+                                lines = [f"{ensure_str(sk).strip()}: {ensure_str(sv).strip()}" for sk, sv in v.items()]
+                            if lines:
+                                section_parts.append(f"{key_hdr}:\n" + "\n".join([f"- {ln}" for ln in lines]))
+                        # List -> bullet list
+                        elif isinstance(v, list):
+                            items = [ensure_str(x).strip() for x in v if ensure_str(x).strip()]
+                            if items:
+                                section_parts.append(f"{key_hdr}:\n" + "\n".join([f"- {it}" for it in items]))
+                        # Scalar -> key: value
+                        else:
+                            val_txt = ensure_str(v).strip()
+                            if val_txt:
+                                section_parts.append(f"{key_hdr}: {val_txt}")
+            except Exception:
+                pass
+        # If this is the last section and an analysis note exists, append it
+        try:
+            if analysis_note and s_idx == total_sections - 1:
+                section_parts.append(f"Analysis Note: {analysis_note}")
+        except Exception:
+            # Non-fatal; continue even if appending analysis note fails
+            pass
 
         section_text = "\n\n".join([p for p in section_parts if p])
 

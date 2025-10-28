@@ -1,3 +1,6 @@
+# Always check drive folder for new files, prompt_path, excel sheet, Use_GPT, Use_Claude, Use_Excel, Enable_Drive_Upload, 
+#  For gpt only: --gpt_only, For claude only: --claude_only
+
 #!/usr/bin/env python3
 """
 Claude 4.1 (Claude Opus 4.1) QnA generator using **Anthropic's built-in Web Search tool**
@@ -47,6 +50,9 @@ import textwrap
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from queue import Queue
 
 import requests
 from dotenv import load_dotenv
@@ -66,6 +72,10 @@ except Exception:  # SDK may not expose types; we'll fall back to plain dicts
     BatchRequest = None  # type: ignore
 from openai import OpenAI
 
+# Google Drive upload integration
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from google_drive_uploader import upload_file_to_drive, TARGET_FOLDER_ID
+
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 DEFAULT_MODEL = "claude-opus-4-1-20250805"  # From your example
 # Default batch size for Anthropic Message Batches (change here if needed)
@@ -78,6 +88,25 @@ USE_EXCEL_DATA: bool = False
 ENABLE_THINKING: bool = True
 USE_CLAUDE: bool = True
 USE_GPT: bool = False
+ENABLE_DRIVE_UPLOAD: bool = False
+
+# ------------------------------
+# 2-Stage Pipeline Configuration
+# ------------------------------
+# Enable 2-stage pipeline (GPT → Claude batch coordination)
+ENABLE_PIPELINE_MODE: bool = False
+
+# Stage 1: GPT parallel processing output directory
+GPT_CONTEXTS_DIR = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/Gpt_Output"
+
+# Stage 2: Claude final output directory
+CLAUDE_FINAL_DIR = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/output"
+
+# Pipeline settings
+GPT_PARALLEL_WORKERS = 5 # Number of parallel GPT threads (10-15 recommended)
+CLAUDE_BATCH_TRIGGER_SIZE = 3  # Trigger Claude batch when this many GPT outputs are ready
+GPT_MAX_RETRIES = 2  # Max retries for GPT API calls
+CLAUDE_POLL_INTERVAL = 5  # Seconds between checking for new GPT outputs
 
 # ------------------------------
 # Logging Setup
@@ -455,6 +484,9 @@ def run_batch_generation(
     ok, fail = 0, 0
     total_input_tokens, total_output_tokens = 0, 0
 
+    # Load checkpoint ONCE at function start to avoid race conditions
+    checkpoint_data = load_checkpoint(output_dir)
+
     shared_system = _build_shared_system_blocks(prompt_text, use_cache)
     try:
         logger.info("Prompt caching (batch): %s", "ENABLED" if use_cache else "DISABLED")
@@ -502,16 +534,31 @@ def run_batch_generation(
                 # Mark as successful in checkpoint (file exists means it was processed)
                 if not no_ingest:
                     ing_ok = trigger_ingestion(filepath, logger)
-                    update_checkpoint(output_dir, row, ing_ok, load_checkpoint(output_dir))
+                    update_checkpoint(output_dir, row, ing_ok, checkpoint_data)
                     if ing_ok:
                         ok += 1
                     else:
                         fail += 1
                         logger.warning("[batch] Marked as failed due to ingestion failure for existing file: %s", filename)
                 else:
-                    update_checkpoint(output_dir, row, True, load_checkpoint(output_dir))
+                    update_checkpoint(output_dir, row, True, checkpoint_data)
                     ok += 1
                     logger.info("[batch] Auto-ingest disabled; marking existing file as completed: %s", filename)
+                
+                # Upload existing file to Google Drive
+                if ENABLE_DRIVE_UPLOAD:
+                    try:
+                        upload_success = upload_file_to_drive(
+                            file_path=filepath,
+                            folder_id=TARGET_FOLDER_ID,
+                            logger=logger
+                        )
+                        if not upload_success:
+                            logger.warning("[batch][existing] Drive upload failed for %s", filename)
+                    except Exception as e:
+                        logger.error("[batch][existing] Drive upload exception for %s: %s", filename, e)
+                else:
+                    logger.info("[batch][existing] Drive upload disabled via ENABLE_DRIVE_UPLOAD flag")
             else:
                 wave_to_process.append(row)
         
@@ -569,9 +616,9 @@ def run_batch_generation(
             # Register this batch in tracker
             add_pending_batch(output_dir, batch_id, i+1, i+len(wave), wave_to_process)
 
-            # Poll until terminal status, but cap waiting time to 45 minutes per execution pool
+            # Poll until terminal status, but cap waiting time to 15 minutes per execution pool
             start_poll = time.time()
-            max_wait_seconds = 45 * 60  # 45 minutes
+            max_wait_seconds = 5 * 60  # 5 minutes
             timed_out = False
             while True:
                 status_obj = client.messages.batches.retrieve(batch_id)
@@ -647,7 +694,7 @@ def run_batch_generation(
                     # Update checkpoint for this row
                     row = next((r for r in wave if _make_custom_id(r) == custom_id), None)
                     if row:
-                        update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
+                        update_checkpoint(output_dir, row, False, checkpoint_data)
                     fail += 1
                     continue
 
@@ -756,7 +803,7 @@ def run_batch_generation(
                             _, user_text_resume = build_user_message(row, use_natural_generation=True)
                         except Exception as e_bum:
                             logger.error("[batch] Missing required fields for resume enqueue (%s): %s", custom_id, e_bum)
-                            update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
+                            update_checkpoint(output_dir, row, False, checkpoint_data)
                             fail += 1
                             continue
                         resume_queue.append({
@@ -773,7 +820,7 @@ def run_batch_generation(
                             _, user_text_resume = build_user_message(row, use_natural_generation=True)
                         except Exception as e_bum:
                             logger.error("[batch] Missing required fields for resume enqueue (no-parts) (%s): %s", custom_id, e_bum)
-                            update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
+                            update_checkpoint(output_dir, row, False, checkpoint_data)
                             fail += 1
                             continue
                         resume_queue.append({
@@ -808,7 +855,7 @@ def run_batch_generation(
                         pass
                 except Exception as e:
                     logger.error("Failed to parse batch item %s JSON: %s", custom_id, e)
-                    update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
+                    update_checkpoint(output_dir, row, False, checkpoint_data)
                     fail += 1
                     continue
 
@@ -823,7 +870,7 @@ def run_batch_generation(
                             out.write(json_text)
                 except Exception as e:
                     logger.error("Failed to write output for %s: %s", filename, e)
-                    update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
+                    update_checkpoint(output_dir, row, False, checkpoint_data)
                     fail += 1
                     continue
 
@@ -833,7 +880,23 @@ def run_batch_generation(
                     ing_ok = trigger_ingestion(filepath, logger)
                 else:
                     logger.info("Auto-ingest disabled via --no_ingest; skipping ingestion for %s", filepath)
-                update_checkpoint(output_dir, row, ing_ok, load_checkpoint(output_dir))
+                
+                # Upload to Google Drive
+                if ENABLE_DRIVE_UPLOAD:
+                    try:
+                        upload_success = upload_file_to_drive(
+                            file_path=filepath,
+                            folder_id=TARGET_FOLDER_ID,
+                            logger=logger
+                        )
+                        if not upload_success:
+                            logger.warning("[batch] Drive upload failed for %s", filename)
+                    except Exception as e:
+                        logger.error("[batch] Drive upload exception for %s: %s", filename, e)
+                else:
+                    logger.info("[batch] Drive upload disabled via ENABLE_DRIVE_UPLOAD flag")
+                
+                update_checkpoint(output_dir, row, ing_ok, checkpoint_data)
                 if ing_ok:
                     ok += 1
                 else:
@@ -919,7 +982,7 @@ def run_batch_generation(
                     logger.error("Resume batch submission failed: %s", e_res)
                     # Mark all queued items as failed in checkpoint and count as fail
                     for r in resume_queue:
-                        update_checkpoint(output_dir, r["row"], False, load_checkpoint(output_dir))
+                        update_checkpoint(output_dir, r["row"], False, checkpoint_data)
                         fail += 1
                     resume_queue = []
                     break
@@ -936,7 +999,7 @@ def run_batch_generation(
                         # mark fail
                         r = resume_map.get(custom_id_r)
                         if r:
-                            update_checkpoint(output_dir, r["row"], False, load_checkpoint(output_dir))
+                            update_checkpoint(output_dir, r["row"], False, checkpoint_data)
                             fail += 1
                         continue
                     message_r = getattr(result_obj_r, "message", None)
@@ -1052,7 +1115,7 @@ def run_batch_generation(
                             pass
                     except Exception as e:
                         logger.error("[resume] Failed to parse JSON for %s: %s", custom_id_r, e)
-                        update_checkpoint(output_dir, r_row, False, load_checkpoint(output_dir))
+                        update_checkpoint(output_dir, r_row, False, checkpoint_data)
                         fail += 1
                         continue
 
@@ -1067,7 +1130,7 @@ def run_batch_generation(
                             out.write(json_text_final)
                 except Exception as e_write:
                     logger.error("[resume] Failed to write output for %s: %s", filename, e_write)
-                    update_checkpoint(output_dir, r_row, False, load_checkpoint(output_dir))
+                    update_checkpoint(output_dir, r_row, False, checkpoint_data)
                     fail += 1
                     continue
 
@@ -1077,7 +1140,23 @@ def run_batch_generation(
                     ing_ok = trigger_ingestion(filepath, logger)
                 else:
                     logger.info("Auto-ingest disabled via --no_ingest; skipping ingestion for %s", filepath)
-                update_checkpoint(output_dir, r_row, ing_ok, load_checkpoint(output_dir))
+                
+                # Upload to Google Drive
+                if ENABLE_DRIVE_UPLOAD:
+                    try:
+                        upload_success = upload_file_to_drive(
+                            file_path=filepath,
+                            folder_id=TARGET_FOLDER_ID,
+                            logger=logger
+                        )
+                        if not upload_success:
+                            logger.warning("[batch][resume] Drive upload failed for %s", filename)
+                    except Exception as e:
+                        logger.error("[batch][resume] Drive upload exception for %s: %s", filename, e)
+                else:
+                    logger.info("[batch][resume] Drive upload disabled via ENABLE_DRIVE_UPLOAD flag")
+                
+                update_checkpoint(output_dir, r_row, ing_ok, checkpoint_data)
                 if ing_ok:
                     ok += 1
                 else:
@@ -1090,12 +1169,12 @@ def run_batch_generation(
             logger.error("Batch API error: %s", e)
             # Mark all rows in wave_to_process as failed in the checkpoint so reruns track them
             for row in wave_to_process:
-                update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
+                update_checkpoint(output_dir, row, False, checkpoint_data)
             fail += len(wave_to_process)
         except Exception as e:
             logger.error("Unexpected error during batch submission/processing: %s", e)
             for row in wave_to_process:
-                update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
+                update_checkpoint(output_dir, row, False, checkpoint_data)
             fail += len(wave_to_process)
     
     return ok, fail, total_input_tokens, total_output_tokens
@@ -1135,6 +1214,858 @@ def _to_json_serializable(obj):
         return str(obj)
     except Exception:
         return None
+
+
+# ------------------------------
+# 2-Stage Pipeline Directory Setup
+# ------------------------------
+
+def setup_pipeline_directories() -> Dict[str, str]:
+    """Create and validate the 2-stage pipeline directory structure.
+    Returns dict with paths to key directories.
+    """
+    dirs = {
+        "gpt_contexts": GPT_CONTEXTS_DIR,
+        "claude_final": CLAUDE_FINAL_DIR,
+        "logs": os.path.join(CLAUDE_FINAL_DIR, "logs"),
+        "checkpoint": os.path.join(CLAUDE_FINAL_DIR, "checkpoint"),
+    }
+    
+    # Create all directories
+    for name, path in dirs.items():
+        os.makedirs(path, exist_ok=True)
+    
+    return dirs
+
+
+def get_gpt_checkpoint_path() -> str:
+    """Get path to the GPT stage checkpoint file."""
+    return os.path.join(CLAUDE_FINAL_DIR, "checkpoint", "checkpoint_gpt.json")
+
+
+def get_claude_checkpoint_path() -> str:
+    """Get path to the Claude stage checkpoint file."""
+    return os.path.join(CLAUDE_FINAL_DIR, "checkpoint", "checkpoint_claude.json")
+
+
+# ------------------------------
+# 2-Stage Pipeline Checkpoint System
+# ------------------------------
+
+def load_gpt_checkpoint() -> Dict[str, Any]:
+    """Load GPT stage checkpoint data.
+    Tracks which products have GPT context generated.
+    """
+    checkpoint_file = get_gpt_checkpoint_path()
+    
+    if os.path.exists(checkpoint_file):
+        try:
+            with open(checkpoint_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                data.setdefault("completed_skus", [])
+                data.setdefault("failed_skus", [])
+                data.setdefault("total_processed", 0)
+                data.setdefault("successful", 0)
+                data.setdefault("failed", 0)
+                data.setdefault("last_updated", None)
+                
+                # Convert to sets for O(1) lookup
+                data["completed_skus"] = set(data["completed_skus"])
+                data["failed_skus"] = set(data["failed_skus"])
+                return data
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Failed to load GPT checkpoint: {e}")
+    
+    return {
+        "completed_skus": set(),
+        "failed_skus": set(),
+        "total_processed": 0,
+        "successful": 0,
+        "failed": 0,
+        "last_updated": None
+    }
+
+
+def save_gpt_checkpoint(checkpoint_data: Dict[str, Any]) -> None:
+    """Save GPT stage checkpoint data."""
+    checkpoint_file = get_gpt_checkpoint_path()
+    checkpoint_copy = checkpoint_data.copy()
+    checkpoint_copy["completed_skus"] = list(checkpoint_copy.get("completed_skus", set()))
+    checkpoint_copy["failed_skus"] = list(checkpoint_copy.get("failed_skus", set()))
+    checkpoint_copy["last_updated"] = datetime.now().isoformat()
+    
+    try:
+        with open(checkpoint_file, "w", encoding="utf-8") as f:
+            json.dump(checkpoint_copy, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.getLogger(__name__).error(f"Failed to save GPT checkpoint: {e}")
+
+
+def update_gpt_checkpoint(sku: str, success: bool, checkpoint_data: Dict[str, Any]) -> None:
+    """Update GPT checkpoint after processing a product."""
+    if success:
+        checkpoint_data.setdefault("completed_skus", set()).add(sku)
+        checkpoint_data.setdefault("failed_skus", set()).discard(sku)
+        checkpoint_data["successful"] = checkpoint_data.get("successful", 0) + 1
+    else:
+        checkpoint_data.setdefault("failed_skus", set()).add(sku)
+        checkpoint_data.setdefault("completed_skus", set()).discard(sku)
+        checkpoint_data["failed"] = checkpoint_data.get("failed", 0) + 1
+    
+    checkpoint_data["total_processed"] = checkpoint_data.get("total_processed", 0) + 1
+    save_gpt_checkpoint(checkpoint_data)
+
+
+def is_gpt_completed(sku: str, checkpoint_data: Dict[str, Any]) -> bool:
+    """Check if GPT stage is completed for a product."""
+    return sku in checkpoint_data.get("completed_skus", set())
+
+
+def load_claude_checkpoint() -> Dict[str, Any]:
+    """Load Claude stage checkpoint data.
+    Tracks which products have final Claude output.
+    """
+    checkpoint_file = get_claude_checkpoint_path()
+    
+    if os.path.exists(checkpoint_file):
+        try:
+            with open(checkpoint_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                data.setdefault("completed_skus", [])
+                data.setdefault("failed_skus", [])
+                data.setdefault("total_processed", 0)
+                data.setdefault("successful", 0)
+                data.setdefault("failed", 0)
+                data.setdefault("last_updated", None)
+                data.setdefault("batches_processed", [])
+                
+                # Convert to sets
+                data["completed_skus"] = set(data["completed_skus"])
+                data["failed_skus"] = set(data["failed_skus"])
+                return data
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Failed to load Claude checkpoint: {e}")
+    
+    return {
+        "completed_skus": set(),
+        "failed_skus": set(),
+        "total_processed": 0,
+        "successful": 0,
+        "failed": 0,
+        "last_updated": None,
+        "batches_processed": []
+    }
+
+
+def save_claude_checkpoint(checkpoint_data: Dict[str, Any]) -> None:
+    """Save Claude stage checkpoint data."""
+    checkpoint_file = get_claude_checkpoint_path()
+    checkpoint_copy = checkpoint_data.copy()
+    checkpoint_copy["completed_skus"] = list(checkpoint_copy.get("completed_skus", set()))
+    checkpoint_copy["failed_skus"] = list(checkpoint_copy.get("failed_skus", set()))
+    checkpoint_copy["last_updated"] = datetime.now().isoformat()
+    
+    try:
+        with open(checkpoint_file, "w", encoding="utf-8") as f:
+            json.dump(checkpoint_copy, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.getLogger(__name__).error(f"Failed to save Claude checkpoint: {e}")
+
+
+def update_claude_checkpoint(sku: str, success: bool, checkpoint_data: Dict[str, Any]) -> None:
+    """Update Claude checkpoint after processing a product."""
+    if success:
+        checkpoint_data.setdefault("completed_skus", set()).add(sku)
+        checkpoint_data.setdefault("failed_skus", set()).discard(sku)
+        checkpoint_data["successful"] = checkpoint_data.get("successful", 0) + 1
+    else:
+        checkpoint_data.setdefault("failed_skus", set()).add(sku)
+        checkpoint_data.setdefault("completed_skus", set()).discard(sku)
+        checkpoint_data["failed"] = checkpoint_data.get("failed", 0) + 1
+    
+    checkpoint_data["total_processed"] = checkpoint_data.get("total_processed", 0) + 1
+    save_claude_checkpoint(checkpoint_data)
+
+
+def is_claude_completed(sku: str, checkpoint_data: Dict[str, Any]) -> bool:
+    """Check if Claude stage is completed for a product."""
+    return sku in checkpoint_data.get("completed_skus", set())
+
+
+# ------------------------------
+# Stage 1: GPT ThreadPool Producer
+# ------------------------------
+
+# Thread-safe lock for checkpoint updates
+_gpt_checkpoint_lock = threading.Lock()
+
+
+def generate_gpt_context(
+    row: Dict[str, str],
+    prompt_text: str,
+    openai_api_key: str,
+    gpt_model: str,
+    logger: logging.Logger,
+    checkpoint_data: Dict[str, Any],
+    max_retries: int = GPT_MAX_RETRIES
+) -> bool:
+    """Generate GPT context for a single product.
+    
+    Args:
+        row: Product row data
+        prompt_text: System prompt for GPT
+        openai_api_key: OpenAI API key
+        gpt_model: GPT model name
+        logger: Logger instance
+        checkpoint_data: Shared checkpoint data dict
+        max_retries: Maximum retry attempts
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    sku = row.get("sku", "")
+    if not sku:
+        logger.warning(f"[GPT] Skipping row without SKU: {row.get('brand', '')} {row.get('product_name', '')}")
+        return False
+    
+    # Create filename and check if already exists
+    filename = f"{sanitize_filename(sku)}.json"
+    output_path = os.path.join(GPT_CONTEXTS_DIR, filename)
+    
+    # Check if already completed (file exists or in checkpoint)
+    if os.path.exists(output_path):
+        logger.info(f"[GPT] ✓ Skipping {sku} (file exists)")
+        with _gpt_checkpoint_lock:
+            if not is_gpt_completed(sku, checkpoint_data):
+                update_gpt_checkpoint(sku, True, checkpoint_data)
+        # Upload existing context file if enabled
+        if ENABLE_DRIVE_UPLOAD:
+            try:
+                ok = upload_file_to_drive(file_path=output_path, folder_id=TARGET_FOLDER_ID, logger=logger)
+                if not ok:
+                    logger.warning(f"[GPT][upload][existing] Drive upload failed for {output_path}")
+            except Exception as e:
+                logger.error(f"[GPT][upload][existing] Exception uploading {output_path}: {e}")
+        return True
+    
+    with _gpt_checkpoint_lock:
+        if is_gpt_completed(sku, checkpoint_data):
+            logger.info(f"[GPT] ✓ Skipping {sku} (checkpoint completed)")
+            # Optionally upload existing file if present
+            if ENABLE_DRIVE_UPLOAD and os.path.exists(output_path):
+                try:
+                    ok = upload_file_to_drive(file_path=output_path, folder_id=TARGET_FOLDER_ID, logger=logger)
+                    if not ok:
+                        logger.warning(f"[GPT][upload][checkpoint] Drive upload failed for {output_path}")
+                except Exception as e:
+                    logger.error(f"[GPT][upload][checkpoint] Exception uploading {output_path}: {e}")
+            return True
+    
+    product_info = f"{row.get('brand', '')} {row.get('product_name', '')} - {row.get('shade_of_lipstick', '')}"
+    logger.info(f"[GPT] Processing {sku}: {product_info}")
+    
+    # Build user message
+    try:
+        _, user_msg = build_user_message(row, use_natural_generation=True)
+    except Exception as e:
+        logger.error(f"[GPT] ✗ Failed to build message for {sku}: {e}")
+        with _gpt_checkpoint_lock:
+            update_gpt_checkpoint(sku, False, checkpoint_data)
+        return False
+    
+    # Retry loop
+    for attempt in range(1, max_retries + 2):  # +2 to allow initial + retries
+        try:
+            start_time = time.time()
+            gpt_output, usage = call_gpt_with_web_search(
+                api_key=openai_api_key,
+                model=gpt_model,
+                user_content=user_msg,
+                system_text=prompt_text,
+                enable_thinking=ENABLE_THINKING,
+                enable_web_search=True
+            )
+            elapsed = time.time() - start_time
+            
+            # Validate output
+            if not gpt_output or not gpt_output.strip():
+                raise ValueError("Empty GPT output received")
+            
+            # Write output to file
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write(gpt_output)
+            
+            # Upload newly written context file if enabled
+            if ENABLE_DRIVE_UPLOAD:
+                try:
+                    ok_up = upload_file_to_drive(file_path=output_path, folder_id=TARGET_FOLDER_ID, logger=logger)
+                    if not ok_up:
+                        logger.warning(f"[GPT][upload][new] Drive upload failed for {output_path}")
+                except Exception as e:
+                    logger.error(f"[GPT][upload][new] Exception uploading {output_path}: {e}")
+            
+            # Update checkpoint
+            with _gpt_checkpoint_lock:
+                update_gpt_checkpoint(sku, True, checkpoint_data)
+            
+            tokens = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+            logger.info(f"[GPT] ✓ Completed {sku} in {elapsed:.1f}s ({tokens} tokens)")
+            return True
+            
+        except Exception as e:
+            # Determine if this was the final allowed attempt
+            is_last_attempt = (attempt >= max_retries + 1)
+            if is_last_attempt:
+                logger.error(f"[GPT] ✗ All attempts failed for {sku}: {e}")
+                with _gpt_checkpoint_lock:
+                    update_gpt_checkpoint(sku, False, checkpoint_data)
+                return False
+            else:
+                logger.warning(f"[GPT] Attempt {attempt} failed for {sku}: {e}")
+                # Only sleep/backoff if more attempts remain beyond this one
+                if attempt <= max_retries:
+                    wait_time = 2 ** attempt  # Exponential backoff
+                    logger.info(f"[GPT] Retrying {sku} in {wait_time}s...")
+                    time.sleep(wait_time)
+    
+    return False
+
+
+def run_gpt_stage(
+    rows: List[Dict[str, str]],
+    prompt_text: str,
+    openai_api_key: str,
+    gpt_model: str,
+    logger: logging.Logger,
+    max_workers: int = GPT_PARALLEL_WORKERS
+) -> Tuple[int, int]:
+    """Run GPT stage with parallel processing using ThreadPoolExecutor.
+    
+    Args:
+        rows: List of product rows to process
+        prompt_text: System prompt for GPT
+        openai_api_key: OpenAI API key
+        gpt_model: GPT model name
+        logger: Logger instance
+        max_workers: Number of parallel workers
+    
+    Returns:
+        Tuple of (successful_count, failed_count)
+    """
+    # Ensure output directory exists
+    os.makedirs(GPT_CONTEXTS_DIR, exist_ok=True)
+    
+    # Load checkpoint
+    checkpoint_data = load_gpt_checkpoint()
+    
+    logger.info("="*60)
+    logger.info(f"[GPT STAGE] Starting with {max_workers} parallel workers")
+    logger.info(f"[GPT STAGE] Total products: {len(rows)}")
+    logger.info(f"[GPT STAGE] Output directory: {GPT_CONTEXTS_DIR}")
+    logger.info("="*60)
+    
+    successful = 0
+    failed = 0
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        future_to_row = {
+            executor.submit(
+                generate_gpt_context,
+                row,
+                prompt_text,
+                openai_api_key,
+                gpt_model,
+                logger,
+                checkpoint_data
+            ): row
+            for row in rows
+        }
+        
+        # Process completed futures as they finish
+        for future in as_completed(future_to_row):
+            row = future_to_row[future]
+            sku = row.get("sku", "unknown")
+            try:
+                result = future.result()
+                if result:
+                    successful += 1
+                else:
+                    failed += 1
+            except Exception as e:
+                logger.error(f"[GPT] ✗ Exception for {sku}: {e}")
+                failed += 1
+    
+    logger.info("="*60)
+    logger.info("[GPT STAGE] Completed")
+    logger.info(f"[GPT STAGE] Successful: {successful}")
+    logger.info(f"[GPT STAGE] Failed: {failed}")
+    logger.info(f"[GPT STAGE] Total: {successful + failed}")
+    logger.info("="*60)
+    
+    return successful, failed
+
+
+# ------------------------------
+# Stage 2: Claude Scheduler (Consumer)
+# ------------------------------
+
+def load_gpt_contexts_into_rows(
+    rows: List[Dict[str, str]],
+    logger: logging.Logger
+) -> List[Dict[str, str]]:
+    """Load GPT context files and inject into product rows.
+    
+    Args:
+        rows: List of product rows
+        logger: Logger instance
+    
+    Returns:
+        List of rows that have GPT contexts ready
+    """
+    ready_rows = []
+    
+    for row in rows:
+        sku = row.get("sku", "")
+        if not sku:
+            continue
+        
+        gpt_filename = f"{sanitize_filename(sku)}.json"
+        gpt_path = os.path.join(GPT_CONTEXTS_DIR, gpt_filename)
+        
+        if os.path.exists(gpt_path):
+            try:
+                with open(gpt_path, "r", encoding="utf-8") as f:
+                    gpt_context = f.read()
+                
+                # Validate GPT context quality
+                if not gpt_context or not gpt_context.strip():
+                    logger.warning(f"[CLAUDE] Empty GPT context for {sku}, skipping")
+                    continue
+                
+                # Check if content is reasonable (at least 50 characters)
+                if len(gpt_context.strip()) < 50:
+                    logger.warning(f"[CLAUDE] GPT context too short for {sku} ({len(gpt_context)} chars), skipping")
+                    continue
+                
+                # Inject GPT context into row
+                row_with_context = row.copy()
+                row_with_context["gpt_context"] = gpt_context
+                ready_rows.append(row_with_context)
+            except Exception as e:
+                logger.error(f"[CLAUDE] Failed to read GPT context for {sku}: {e}")
+    
+    return ready_rows
+
+
+def run_claude_scheduler(
+    all_rows: List[Dict[str, str]],
+    prompt_text: str,
+    anthropic_api_key: str,
+    claude_model: str,
+    logger: logging.Logger,
+    batch_size: int = CLAUDE_BATCH_TRIGGER_SIZE,
+    max_tokens: int = 32000,
+    no_ingest: bool = False,
+    use_cache: bool = True
+) -> Tuple[int, int, int, int]:
+    """Run Claude scheduler to process GPT-ready products in batches.
+    
+    Args:
+        all_rows: All product rows
+        prompt_text: Claude system prompt
+        anthropic_api_key: Anthropic API key
+        claude_model: Claude model name
+        logger: Logger instance
+        batch_size: Number of products per Claude batch
+        max_tokens: Max tokens for Claude
+        no_ingest: Skip ingestion if True
+        use_cache: Enable prompt caching
+    
+    Returns:
+        Tuple of (ok_count, fail_count, total_input_tokens, total_output_tokens)
+    """
+    os.makedirs(CLAUDE_FINAL_DIR, exist_ok=True)
+    
+    logger.info("="*60)
+    logger.info("[CLAUDE SCHEDULER] Starting")
+    logger.info(f"[CLAUDE SCHEDULER] Batch size: {batch_size}")
+    logger.info(f"[CLAUDE SCHEDULER] Output directory: {CLAUDE_FINAL_DIR}")
+    logger.info("="*60)
+    
+    # Load GPT contexts into rows
+    ready_rows = load_gpt_contexts_into_rows(all_rows, logger)
+    logger.info(f"[CLAUDE SCHEDULER] Found {len(ready_rows)} products with GPT contexts ready")
+    
+    if not ready_rows:
+        logger.info("[CLAUDE SCHEDULER] No products ready for Claude processing")
+        return 0, 0, 0, 0
+    
+    # Load Claude checkpoint
+    claude_checkpoint = load_claude_checkpoint()
+    
+    # Filter out already completed products
+    remaining_rows = []
+    for row in ready_rows:
+        sku = row.get("sku", "")
+        if not is_claude_completed(sku, claude_checkpoint):
+            remaining_rows.append(row)
+        else:
+            logger.info(f"[CLAUDE SCHEDULER] Skipping {sku} (already completed)")
+    
+    logger.info(f"[CLAUDE SCHEDULER] {len(remaining_rows)} products need Claude processing")
+    
+    if not remaining_rows:
+        logger.info("[CLAUDE SCHEDULER] All products already completed")
+        return 0, 0, 0, 0
+    
+    # Create batches
+    batches = [remaining_rows[i:i+batch_size] for i in range(0, len(remaining_rows), batch_size)]
+    logger.info(f"[CLAUDE SCHEDULER] Created {len(batches)} batches")
+    
+    # Process each batch
+    total_ok, total_fail = 0, 0
+    total_input_tokens, total_output_tokens = 0, 0
+    
+    for batch_idx, batch in enumerate(batches, 1):
+        logger.info(f"[CLAUDE SCHEDULER] Processing batch {batch_idx}/{len(batches)} ({len(batch)} products)")
+        
+        try:
+            ok, fail, in_tok, out_tok = run_batch_generation(
+                api_key=anthropic_api_key,
+                model=claude_model,
+                rows=batch,
+                prompt_text=prompt_text,
+                max_tokens=max_tokens,
+                batch_size=len(batch),
+                output_dir=CLAUDE_FINAL_DIR,
+                logger=logger,
+                no_ingest=no_ingest,
+                use_cache=use_cache
+            )
+            
+            total_ok += ok
+            total_fail += fail
+            total_input_tokens += in_tok
+            total_output_tokens += out_tok
+            
+            logger.info(f"[CLAUDE SCHEDULER] Batch {batch_idx} completed: {ok} successful, {fail} failed")
+            
+        except Exception as e:
+            logger.error(f"[CLAUDE SCHEDULER] Batch {batch_idx} failed: {e}")
+            total_fail += len(batch)
+    
+    logger.info("="*60)
+    logger.info("[CLAUDE SCHEDULER] Completed")
+    logger.info(f"[CLAUDE SCHEDULER] Total successful: {total_ok}")
+    logger.info(f"[CLAUDE SCHEDULER] Total failed: {total_fail}")
+    logger.info(f"[CLAUDE SCHEDULER] Total tokens: {total_input_tokens + total_output_tokens}")
+    logger.info("="*60)
+    
+    return total_ok, total_fail, total_input_tokens, total_output_tokens
+
+
+# ------------------------------
+# Real-Time Pipeline Coordination
+# ------------------------------
+
+# Shared queue for real-time coordination
+_ready_queue: Queue = Queue()
+_watcher_running = False
+_watcher_stop_flag = threading.Event()
+
+
+def gpt_worker_with_queue(
+    row: Dict[str, str],
+    prompt_text: str,
+    openai_api_key: str,
+    gpt_model: str,
+    logger: logging.Logger,
+    checkpoint_data: Dict[str, Any],
+    ready_queue: Queue
+) -> bool:
+    """GPT worker that adds completed products to queue for real-time Claude processing.
+    
+    Args:
+        row: Product row
+        prompt_text: GPT system prompt
+        openai_api_key: OpenAI API key
+        gpt_model: GPT model name
+        logger: Logger instance
+        checkpoint_data: Shared checkpoint data
+        ready_queue: Queue to push completed products
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    success = generate_gpt_context(
+        row=row,
+        prompt_text=prompt_text,
+        openai_api_key=openai_api_key,
+        gpt_model=gpt_model,
+        logger=logger,
+        checkpoint_data=checkpoint_data
+    )
+    
+    if success:
+        # Load GPT context and add to queue
+        sku = row.get("sku", "")
+        gpt_filename = f"{sanitize_filename(sku)}.json"
+        gpt_path = os.path.join(GPT_CONTEXTS_DIR, gpt_filename)
+        
+        try:
+            with open(gpt_path, "r", encoding="utf-8") as f:
+                gpt_context = f.read()
+            
+            row_with_context = row.copy()
+            row_with_context["gpt_context"] = gpt_context
+            ready_queue.put(row_with_context)
+            logger.debug(f"[QUEUE] Added {sku} to ready queue")
+        except Exception as e:
+            logger.error(f"[QUEUE] Failed to read GPT context for {sku}: {e}")
+    
+    return success
+
+
+def claude_watcher(
+    prompt_text: str,
+    anthropic_api_key: str,
+    claude_model: str,
+    logger: logging.Logger,
+    ready_queue: Queue,
+    stats_dict: Dict[str, int],
+    batch_size: int = CLAUDE_BATCH_TRIGGER_SIZE,
+    max_tokens: int = 32000,
+    no_ingest: bool = False,
+    use_cache: bool = True
+) -> None:
+    """Background thread that watches for ready GPT products and triggers Claude batches.
+    
+    Args:
+        prompt_text: Claude system prompt
+        anthropic_api_key: Anthropic API key
+        claude_model: Claude model name
+        logger: Logger instance
+        ready_queue: Queue to watch for ready products
+        stats_dict: Shared dict to track Claude statistics
+        batch_size: Trigger batch when this many products ready
+        max_tokens: Max tokens for Claude
+        no_ingest: Skip ingestion if True
+        use_cache: Enable prompt caching
+    """
+    global _watcher_running
+    _watcher_running = True
+    
+    logger.info(f"[CLAUDE WATCHER] Started - will trigger batch every {batch_size} products")
+    
+    buffer: List[Dict[str, str]] = []
+    stats_dict["successful"] = 0
+    stats_dict["failed"] = 0
+    
+    try:
+        while not _watcher_stop_flag.is_set():
+            try:
+                # Wait for product with timeout to allow checking stop flag
+                row = ready_queue.get(timeout=1)
+                buffer.append(row)
+                
+                sku = row.get("sku", "unknown")
+                logger.info(f"[CLAUDE WATCHER] Buffer: {len(buffer)}/{batch_size} ({sku} added)")
+                
+                # Trigger batch when buffer is full
+                if len(buffer) >= batch_size:
+                    logger.info(f"[CLAUDE WATCHER] Triggering Claude batch for {len(buffer)} products")
+                    
+                    try:
+                        ok, fail, in_tok, out_tok = run_batch_generation(
+                            api_key=anthropic_api_key,
+                            model=claude_model,
+                            rows=buffer,
+                            prompt_text=prompt_text,
+                            max_tokens=max_tokens,
+                            batch_size=len(buffer),
+                            output_dir=CLAUDE_FINAL_DIR,
+                            logger=logger,
+                            no_ingest=no_ingest,
+                            use_cache=use_cache
+                        )
+                        
+                        # Track statistics
+                        stats_dict["successful"] += ok
+                        stats_dict["failed"] += fail
+                        
+                        logger.info(f"[CLAUDE WATCHER] Batch completed: {ok} successful, {fail} failed")
+                    except Exception as e:
+                        logger.error(f"[CLAUDE WATCHER] Batch failed: {e}")
+                        # Mark all products in buffer as failed
+                        stats_dict["failed"] += len(buffer)
+                    
+                    buffer.clear()
+                    
+            except Exception as e:
+                # Improved error handling
+                if not isinstance(e, Exception) or str(e):  # Not just timeout
+                    logger.error(f"[CLAUDE WATCHER] Unexpected error in queue processing: {e}")
+                continue
+    
+    finally:
+        # Process remaining items in buffer when stopping
+        if buffer:
+            logger.info(f"[CLAUDE WATCHER] Processing final batch of {len(buffer)} products")
+            try:
+                ok, fail, in_tok, out_tok = run_batch_generation(
+                    api_key=anthropic_api_key,
+                    model=claude_model,
+                    rows=buffer,
+                    prompt_text=prompt_text,
+                    max_tokens=max_tokens,
+                    batch_size=len(buffer),
+                    output_dir=CLAUDE_FINAL_DIR,
+                    logger=logger,
+                    no_ingest=no_ingest,
+                    use_cache=use_cache
+                )
+                
+                # Track final batch statistics
+                stats_dict["successful"] += ok
+                stats_dict["failed"] += fail
+                
+                logger.info(f"[CLAUDE WATCHER] Final batch completed: {ok} successful, {fail} failed")
+            except Exception as e:
+                logger.error(f"[CLAUDE WATCHER] Final batch failed: {e}")
+                # Mark all products in final buffer as failed
+                stats_dict["failed"] += len(buffer)
+        
+        _watcher_running = False
+        logger.info("[CLAUDE WATCHER] Stopped")
+
+
+def run_realtime_pipeline(
+    rows: List[Dict[str, str]],
+    gpt_prompt: str,
+    claude_prompt: str,
+    openai_api_key: str,
+    anthropic_api_key: str,
+    gpt_model: str,
+    claude_model: str,
+    logger: logging.Logger,
+    gpt_workers: int = GPT_PARALLEL_WORKERS,
+    claude_batch_size: int = CLAUDE_BATCH_TRIGGER_SIZE,
+    max_tokens: int = 32000,
+    no_ingest: bool = False,
+    use_cache: bool = True
+) -> Tuple[int, int, int, int]:
+    """Run real-time pipeline where Claude batches start while GPT is still running.
+    
+    Args:
+        rows: List of product rows
+        gpt_prompt: GPT system prompt
+        claude_prompt: Claude system prompt
+        openai_api_key: OpenAI API key
+        anthropic_api_key: Anthropic API key
+        gpt_model: GPT model name
+        claude_model: Claude model name
+        logger: Logger instance
+        gpt_workers: Number of parallel GPT workers
+        claude_batch_size: Claude batch trigger size
+        max_tokens: Max tokens for Claude
+        no_ingest: Skip ingestion if True
+        use_cache: Enable prompt caching
+    
+    Returns:
+        Tuple of (gpt_successful, gpt_failed, claude_successful, claude_failed)
+    """
+    global _watcher_stop_flag
+    _watcher_stop_flag.clear()
+    
+    # Setup directories
+    os.makedirs(GPT_CONTEXTS_DIR, exist_ok=True)
+    os.makedirs(CLAUDE_FINAL_DIR, exist_ok=True)
+    
+    logger.info("="*60)
+    logger.info("[REAL-TIME PIPELINE] Starting")
+    logger.info(f"[REAL-TIME PIPELINE] GPT workers: {gpt_workers}")
+    logger.info(f"[REAL-TIME PIPELINE] Claude batch size: {claude_batch_size}")
+    logger.info(f"[REAL-TIME PIPELINE] Total products: {len(rows)}")
+    logger.info("="*60)
+    
+    # Load checkpoints
+    gpt_checkpoint = load_gpt_checkpoint()
+    
+    # Create shared dictionary for Claude statistics
+    claude_stats = {"successful": 0, "failed": 0}
+    
+    # Start Claude watcher thread
+    ready_queue = Queue()
+    watcher_thread = threading.Thread(
+        target=claude_watcher,
+        args=(
+            claude_prompt,
+            anthropic_api_key,
+            claude_model,
+            logger,
+            ready_queue,
+            claude_stats,  # Pass shared stats dict
+            claude_batch_size,
+            max_tokens,
+            no_ingest,
+            use_cache
+        ),
+        daemon=True
+    )
+    watcher_thread.start()
+    logger.info("[REAL-TIME PIPELINE] Claude watcher thread started")
+    
+    # Run GPT stage with queue integration
+    gpt_successful = 0
+    gpt_failed = 0
+    
+    with ThreadPoolExecutor(max_workers=gpt_workers) as executor:
+        future_to_row = {
+            executor.submit(
+                gpt_worker_with_queue,
+                row,
+                gpt_prompt,
+                openai_api_key,
+                gpt_model,
+                logger,
+                gpt_checkpoint,
+                ready_queue
+            ): row
+            for row in rows
+        }
+        
+        for future in as_completed(future_to_row):
+            row = future_to_row[future]
+            sku = row.get("sku", "unknown")
+            try:
+                result = future.result()
+                if result:
+                    gpt_successful += 1
+                else:
+                    gpt_failed += 1
+            except Exception as e:
+                logger.error(f"[GPT] Exception for {sku}: {e}")
+                gpt_failed += 1
+    
+    logger.info("[REAL-TIME PIPELINE] GPT stage completed")
+    logger.info(f"[REAL-TIME PIPELINE] GPT successful: {gpt_successful}, failed: {gpt_failed}")
+    
+    # Stop watcher thread
+    logger.info("[REAL-TIME PIPELINE] Stopping Claude watcher...")
+    _watcher_stop_flag.set()
+    watcher_thread.join(timeout=60)  # Wait up to 60 seconds for watcher to finish
+    
+    # Get final Claude statistics from shared dict
+    claude_successful = claude_stats.get("successful", 0)
+    claude_failed = claude_stats.get("failed", 0)
+    
+    logger.info("="*60)
+    logger.info("[REAL-TIME PIPELINE] Completed")
+    logger.info(f"[REAL-TIME PIPELINE] Claude successful: {claude_successful}, failed: {claude_failed}")
+    logger.info("="*60)
+    
+    return gpt_successful, gpt_failed, claude_successful, claude_failed
 
 
 # ------------------------------
@@ -1360,6 +2291,9 @@ def resume_pending_batches(
     client = Anthropic(api_key=api_key, default_headers={"anthropic-beta": "web-search-2025-03-05"})
     shared_system = _build_shared_system_blocks(prompt_text, use_cache)
     
+    # Load checkpoint ONCE at function start to avoid race conditions
+    checkpoint_data = load_checkpoint(output_dir)
+    
     ok, fail = 0, 0
     total_input_tokens, total_output_tokens = 0, 0
     
@@ -1427,7 +2361,7 @@ def resume_pending_batches(
                             "full_name": row_minimal.get("full_name", ""),
                             "s_no": row_minimal.get("s_no", ""),
                         }
-                        update_checkpoint(output_dir, full_row, False, load_checkpoint(output_dir))
+                        update_checkpoint(output_dir, full_row, False, checkpoint_data)
                     fail += 1
                     continue
                 
@@ -1523,7 +2457,7 @@ def resume_pending_batches(
                     
                 except Exception as e:
                     logger.error("[resume] Failed to parse JSON for %s: %s", custom_id, e)
-                    update_checkpoint(output_dir, full_row, False, load_checkpoint(output_dir))
+                    update_checkpoint(output_dir, full_row, False, checkpoint_data)
                     fail += 1
                     continue
                 
@@ -1536,7 +2470,7 @@ def resume_pending_batches(
                             out.write(text)
                 except Exception as e:
                     logger.error("[resume] Failed to write output for %s: %s", filename, e)
-                    update_checkpoint(output_dir, full_row, False, load_checkpoint(output_dir))
+                    update_checkpoint(output_dir, full_row, False, checkpoint_data)
                     fail += 1
                     continue
                 
@@ -1547,7 +2481,22 @@ def resume_pending_batches(
                 else:
                     logger.info("[resume] Auto-ingest disabled; skipping ingestion for %s", filepath)
                 
-                update_checkpoint(output_dir, full_row, ing_ok, load_checkpoint(output_dir))
+                # Upload to Google Drive
+                if ENABLE_DRIVE_UPLOAD:
+                    try:
+                        upload_success = upload_file_to_drive(
+                            file_path=filepath,
+                            folder_id=TARGET_FOLDER_ID,
+                            logger=logger
+                        )
+                        if not upload_success:
+                            logger.warning("[resume] Drive upload failed for %s", filename)
+                    except Exception as e:
+                        logger.error("[resume] Drive upload exception for %s: %s", filename, e)
+                else:
+                    logger.info("[resume] Drive upload disabled via ENABLE_DRIVE_UPLOAD flag")
+                
+                update_checkpoint(output_dir, full_row, ing_ok, checkpoint_data)
                 if ing_ok:
                     ok += 1
                 else:
@@ -1628,7 +2577,7 @@ def resume_pending_batches(
                 except Exception as e_res:
                     logger.error("[resume] Resume batch submission failed: %s", e_res)
                     for r in resume_queue:
-                        update_checkpoint(output_dir, r["row"], False, load_checkpoint(output_dir))
+                        update_checkpoint(output_dir, r["row"], False, checkpoint_data)
                         fail += 1
                     resume_queue = []
                     break
@@ -1644,7 +2593,7 @@ def resume_pending_batches(
                     if getattr(result_obj_r, "type", None) != "succeeded":
                         r = resume_map.get(custom_id_r)
                         if r:
-                            update_checkpoint(output_dir, r["row"], False, load_checkpoint(output_dir))
+                            update_checkpoint(output_dir, r["row"], False, checkpoint_data)
                             fail += 1
                         continue
                     message_r = getattr(result_obj_r, "message", None)
@@ -1731,7 +2680,7 @@ def resume_pending_batches(
                                 out.write(raw_for_parse_r)
                     except Exception as e_write:
                         logger.error("[resume] Failed to write output for %s: %s", filename_r, e_write)
-                        update_checkpoint(output_dir, r_row, False, load_checkpoint(output_dir))
+                        update_checkpoint(output_dir, r_row, False, checkpoint_data)
                         fail += 1
                         continue
                     ing_ok_r = True
@@ -1739,7 +2688,23 @@ def resume_pending_batches(
                         ing_ok_r = trigger_ingestion(filepath_r, logger)
                     else:
                         logger.info("[resume] Auto-ingest disabled; skipping ingestion for %s", filepath_r)
-                    update_checkpoint(output_dir, r_row, ing_ok_r, load_checkpoint(output_dir))
+                    
+                    # Upload to Google Drive
+                    if ENABLE_DRIVE_UPLOAD:
+                        try:
+                            upload_success = upload_file_to_drive(
+                                file_path=filepath_r,
+                                folder_id=TARGET_FOLDER_ID,
+                                logger=logger
+                            )
+                            if not upload_success:
+                                logger.warning("[resume][followup] Drive upload failed for %s", filename_r)
+                        except Exception as e:
+                            logger.error("[resume][followup] Drive upload exception for %s: %s", filename_r, e)
+                    else:
+                        logger.info("[resume][followup] Drive upload disabled via ENABLE_DRIVE_UPLOAD flag")
+                    
+                    update_checkpoint(output_dir, r_row, ing_ok_r, checkpoint_data)
                     if ing_ok_r:
                         ok += 1
                     else:
@@ -1758,7 +2723,7 @@ def resume_pending_batches(
                     "shade_of_lipstick": row_minimal.get("shade_of_lipstick", ""),
                     "sku": row_minimal.get("sku", "")
                 }
-                update_checkpoint(output_dir, full_row, False, load_checkpoint(output_dir))
+                update_checkpoint(output_dir, full_row, False, checkpoint_data)
             fail += len(rows_minimal)
     
     return ok, fail, total_input_tokens, total_output_tokens
@@ -1786,12 +2751,28 @@ def build_user_message(product_row: Dict[str, str], use_natural_generation: bool
 
     if use_natural_generation:
         # Dynamic per-product message (non-cacheable). System is supplied elsewhere for batching.
-        user_text = textwrap.dedent(
-            f"""
-            Product Information:
-            {json.dumps(product_for_model, ensure_ascii=False, indent=2)}
-            """
-        ).strip()
+        # Check if GPT context is provided (for Claude stage)
+        gpt_context = product_row.get("gpt_context", "")
+        
+        if gpt_context:
+            # Claude stage: include GPT context
+            user_text = textwrap.dedent(
+                f"""
+                Product Information:
+                {json.dumps(product_for_model, ensure_ascii=False, indent=2)}
+                
+                GPT Context Summary:
+                {gpt_context}
+                """
+            ).strip()
+        else:
+            # GPT stage: product info only
+            user_text = textwrap.dedent(
+                f"""
+                Product Information:
+                {json.dumps(product_for_model, ensure_ascii=False, indent=2)}
+                """
+            ).strip()
         return "", user_text
     else:
         raise ValueError("use_natural_generation=False is not supported. Refusing to build an alternate prompt shape.")
@@ -2064,7 +3045,7 @@ def call_gpt_with_web_search(
     kwargs["text"] = {"verbosity": "high"}
     if enable_web_search:
         kwargs["tools"] = [{"type": "web_search"}]
-    kwargs["max_output_tokens"] = max_tokens
+    # max_output_tokens already set above
 
     t0 = time.time()
     resp = client.responses.create(**kwargs)
@@ -2133,6 +3114,16 @@ def main() -> None:
     parser.add_argument("--no_batch", action="store_true", help="Disable Anthropic Message Batches API and use synchronous requests")
     parser.add_argument("--no_cache", action="store_true", help="Disable Anthropic prompt caching (use for token price comparison)")
     parser.add_argument("--resume_batches", action="store_true", help="Resume processing of pending batches that timed out during polling")
+    
+    # 2-Stage Pipeline arguments
+    parser.add_argument("--pipeline", action="store_true", help="Enable 2-stage pipeline mode (GPT → Claude)")
+    parser.add_argument("--pipeline_mode", choices=["sequential", "realtime"], default="sequential", 
+                        help="Pipeline mode: 'sequential' (GPT finishes first) or 'realtime' (Claude starts while GPT runs)")
+    parser.add_argument("--gpt_only", action="store_true", help="Run only GPT stage (generate contexts)")
+    parser.add_argument("--claude_only", action="store_true", help="Run only Claude stage (process existing GPT contexts)")
+    parser.add_argument("--gpt_workers", type=int, default=GPT_PARALLEL_WORKERS, help=f"Number of parallel GPT workers (default: {GPT_PARALLEL_WORKERS})")
+    parser.add_argument("--claude_batch_size", type=int, default=CLAUDE_BATCH_TRIGGER_SIZE, help=f"Claude batch size (default: {CLAUDE_BATCH_TRIGGER_SIZE})")
+    
     args, unknown = parser.parse_known_args()
     # Log received CLI for diagnostics
     try:
@@ -2140,8 +3131,9 @@ def main() -> None:
         logging.getLogger(__name__).info("Parsed flags: no_batch=%s, no_ingest=%s, no_cache=%s, resume_batches=%s", args.no_batch, args.no_ingest, args.no_cache, args.resume_batches)
     except Exception:
         pass
-    # Hardcoded file paths
-    prompt_path = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/data/beauty_prompt_restored.json"
+    # Hardcoded prompt paths (separate for GPT and Claude)
+    gpt_prompt_path = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/data/gpt_prompt.json"
+    claude_prompt_path = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/data/beauty_prompt_restored(1).json"
     
     # Data source selection based on USE_EXCEL_DATA parameter
     if USE_EXCEL_DATA:
@@ -2234,10 +3226,10 @@ def main() -> None:
         logger.info("🔄 RESUME MODE: Processing pending batches...")
         logger.info("="*60)
         
-        # Load prompt (needed for resume processing)
+        # Load Claude prompt (needed for resume processing)
         try:
-            prompt_text = read_prompt(prompt_path)
-            logger.info(f"Loaded prompt from: {prompt_path}")
+            claude_prompt_text = read_prompt(claude_prompt_path)
+            logger.info(f"Loaded Claude prompt from: {claude_prompt_path}")
         except Exception as e:
             logger.error(f"Failed to load prompt file: {e}")
             sys.exit(1)
@@ -2247,7 +3239,7 @@ def main() -> None:
         ok, fail, in_tok, out_tok = resume_pending_batches(
             api_key=anthropic_api_key,
             model=model,
-            prompt_text=prompt_text,
+            prompt_text=claude_prompt_text,
             max_tokens=max_tokens,
             output_dir=output_dir,
             logger=logger,
@@ -2276,8 +3268,13 @@ def main() -> None:
     # Load configuration files
     logger.info("Loading configuration files...")
     try:
-        prompt_text = read_prompt(prompt_path)
-        logger.info(f"Loaded prompt from: {prompt_path}")
+        # Load prompts separately for GPT and Claude
+        gpt_prompt = read_prompt(gpt_prompt_path)
+        logger.info(f"Loaded GPT prompt from: {gpt_prompt_path}")
+        claude_prompt = read_prompt(claude_prompt_path)
+        logger.info(f"Loaded Claude prompt from: {claude_prompt_path}")
+        # Backward compatibility variable for code paths that still reference 'prompt_text' for GPT
+        prompt_text = gpt_prompt
         
         # Always use inline shape-only REQUIRED JSON FORMAT; no external schema file
         
@@ -2287,19 +3284,33 @@ def main() -> None:
         logger.error(f"Failed to load configuration files: {e}")
         sys.exit(1)
 
-    # Filter out already completed products
+    # Filter out already completed products (check both checkpoint and file existence)
     remaining_rows = []
     skipped_checkpoint = 0
+    skipped_existing_files = 0
     
     for row in rows:
+        # Check checkpoint first
         if is_product_completed(row, checkpoint_data):
             skipped_checkpoint += 1
             logger.debug(f"Skipping already completed: {row['brand']} {row['product_name']} - {row['shade_of_lipstick']} (SKU: {row.get('sku', 'N/A')})")
-        else:
-            remaining_rows.append(row)
+            continue
+        
+        # Also check if output file already exists (even if marked as failed in checkpoint)
+        filename = create_output_filename(row)
+        filepath = os.path.join(output_dir, filename)
+        if os.path.exists(filepath):
+            skipped_existing_files += 1
+            logger.debug(f"Skipping existing file: {filename}")
+            continue
+        
+        # Neither completed in checkpoint nor file exists -> needs processing
+        remaining_rows.append(row)
     
     if skipped_checkpoint > 0:
         logger.info(f"🔄 Skipped {skipped_checkpoint} already completed products from checkpoint")
+    if skipped_existing_files > 0:
+        logger.info(f"📁 Skipped {skipped_existing_files} products with existing output files")
     
     logger.info(f"📊 Products to process: {len(remaining_rows)} (out of {len(rows)} total)")
 
@@ -2317,7 +3328,195 @@ def main() -> None:
     # Prepare debug directory if enabled
     debug_root = os.path.join(output_dir, "debug") if args.debug else None
 
+    # ============================================================
+    # 2-STAGE PIPELINE MODE
+    # ============================================================
+    if args.pipeline or args.gpt_only or args.claude_only:
+        logger.info("="*60)
+        logger.info("🚀 2-STAGE PIPELINE MODE ENABLED")
+        logger.info("="*60)
+        
+        # Setup pipeline directories
+        pipeline_dirs = setup_pipeline_directories()
+        logger.info(f"📁 GPT contexts directory: {pipeline_dirs['gpt_contexts']}")
+        logger.info(f"📁 Claude final directory: {pipeline_dirs['claude_final']}")
+        logger.info(f"📁 Checkpoint directory: {pipeline_dirs['checkpoint']}")
+        
+        # Validate API keys for pipeline
+        if not openai_api_key:
+            logger.error("OPENAI_API_KEY is required for GPT stage")
+            sys.exit(2)
+        if not anthropic_api_key and not args.gpt_only:
+            logger.error("ANTHROPIC_API_KEY is required for Claude stage")
+            sys.exit(2)
+        
+        # Prompts already loaded above: gpt_prompt and claude_prompt
+        
+        gpt_model = "gpt-5"  # GPT-5 for context generation
+        claude_model = DEFAULT_MODEL  # claude-opus-4-1-20250805
+        
+        # GPT ONLY MODE
+        if args.gpt_only:
+            logger.info("🔧 Running GPT stage only (generating contexts)")
+            logger.info(f"Workers: {args.gpt_workers}")
+            
+            gpt_ok, gpt_fail = run_gpt_stage(
+                rows=rows,  # Use all rows, not remaining_rows (checkpoint handles filtering)
+                prompt_text=gpt_prompt,
+                openai_api_key=openai_api_key,
+                gpt_model=gpt_model,
+                logger=logger,
+                max_workers=args.gpt_workers
+            )
+            
+            total_time = time.time() - start_time
+            logger.info("="*60)
+            logger.info("GPT Stage Completed")
+            logger.info(f"End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info(f"Duration: {total_time:.2f} seconds ({total_time/60:.2f} minutes)")
+            logger.info(f"Successful: {gpt_ok}")
+            logger.info(f"Failed: {gpt_fail}")
+            logger.info(f"Total: {gpt_ok + gpt_fail}")
+            logger.info(f"📁 GPT contexts saved to: {GPT_CONTEXTS_DIR}")
+            logger.info("="*60)
+            return
+        
+        # CLAUDE ONLY MODE
+        elif args.claude_only:
+            logger.info("🔧 Running Claude stage only (processing existing GPT contexts)")
+            logger.info(f"Batch size: {args.claude_batch_size}")
+            
+            claude_ok, claude_fail, in_tok, out_tok = run_claude_scheduler(
+                all_rows=rows,
+                prompt_text=claude_prompt,
+                anthropic_api_key=anthropic_api_key,
+                claude_model=claude_model,
+                logger=logger,
+                batch_size=args.claude_batch_size,
+                max_tokens=max_tokens,
+                no_ingest=args.no_ingest,
+                use_cache=use_prompt_cache
+            )
+            
+            total_time = time.time() - start_time
+            logger.info("="*60)
+            logger.info("Claude Stage Completed")
+            logger.info(f"End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info(f"Duration: {total_time:.2f} seconds ({total_time/60:.2f} minutes)")
+            logger.info(f"Successful: {claude_ok}")
+            logger.info(f"Failed: {claude_fail}")
+            logger.info(f"Total: {claude_ok + claude_fail}")
+            logger.info(f"💰 Tokens: {in_tok:,} input + {out_tok:,} output = {in_tok + out_tok:,}")
+            logger.info(f"📁 Claude outputs saved to: {CLAUDE_FINAL_DIR}")
+            logger.info("="*60)
+            return
+        
+        # FULL PIPELINE MODE
+        else:
+            if args.pipeline_mode == "realtime":
+                logger.info("🔧 Running REAL-TIME pipeline (Claude batches trigger while GPT runs)")
+                logger.info(f"GPT workers: {args.gpt_workers}")
+                logger.info(f"Claude batch size: {args.claude_batch_size}")
+                
+                gpt_ok, gpt_fail, claude_ok, claude_fail = run_realtime_pipeline(
+                    rows=rows,
+                    gpt_prompt=gpt_prompt,
+                    claude_prompt=claude_prompt,
+                    openai_api_key=openai_api_key,
+                    anthropic_api_key=anthropic_api_key,
+                    gpt_model=gpt_model,
+                    claude_model=claude_model,
+                    logger=logger,
+                    gpt_workers=args.gpt_workers,
+                    claude_batch_size=args.claude_batch_size,
+                    max_tokens=max_tokens,
+                    no_ingest=args.no_ingest,
+                    use_cache=use_prompt_cache
+                )
+                
+                total_time = time.time() - start_time
+                logger.info("\n" + "="*60)
+                logger.info("Real-Time Pipeline Completed")
+                logger.info("="*60)
+                logger.info(f"End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                logger.info(f"Total duration: {total_time:.2f} seconds ({total_time/60:.2f} minutes)")
+                logger.info("")
+                logger.info("📊 STAGE 1 (GPT):")
+                logger.info(f"   Successful: {gpt_ok}")
+                logger.info(f"   Failed: {gpt_fail}")
+                logger.info(f"   Total: {gpt_ok + gpt_fail}")
+                logger.info("")
+                logger.info("📊 STAGE 2 (Claude - Real-time):")
+                logger.info(f"   Successful: {claude_ok}")
+                logger.info(f"   Failed: {claude_fail}")
+                logger.info(f"   Total: {claude_ok + claude_fail}")
+                logger.info("")
+                logger.info(f"📁 GPT contexts: {GPT_CONTEXTS_DIR}")
+                logger.info(f"📁 Final outputs: {CLAUDE_FINAL_DIR}")
+                logger.info("="*60)
+                return
+                
+            else:  # sequential mode
+                logger.info("🔧 Running SEQUENTIAL pipeline (GPT first, then Claude)")
+                logger.info(f"GPT workers: {args.gpt_workers}")
+                logger.info(f"Claude batch size: {args.claude_batch_size}")
+                
+                # Stage 1: GPT
+                logger.info("\n" + "="*60)
+                logger.info("STAGE 1: GPT Context Generation")
+                logger.info("="*60)
+                gpt_ok, gpt_fail = run_gpt_stage(
+                    rows=rows,
+                    prompt_text=gpt_prompt,
+                    openai_api_key=openai_api_key,
+                    gpt_model=gpt_model,
+                    logger=logger,
+                    max_workers=args.gpt_workers
+                )
+                
+                # Stage 2: Claude
+                logger.info("\n" + "="*60)
+                logger.info("STAGE 2: Claude Batch Processing")
+                logger.info("="*60)
+                claude_ok, claude_fail, in_tok, out_tok = run_claude_scheduler(
+                    all_rows=rows,
+                    prompt_text=claude_prompt,
+                    anthropic_api_key=anthropic_api_key,
+                    claude_model=claude_model,
+                    logger=logger,
+                    batch_size=args.claude_batch_size,
+                    max_tokens=max_tokens,
+                    no_ingest=args.no_ingest,
+                    use_cache=use_prompt_cache
+                )
+                
+                total_time = time.time() - start_time
+                logger.info("\n" + "="*60)
+                logger.info("Sequential Pipeline Completed")
+                logger.info("="*60)
+                logger.info(f"End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                logger.info(f"Total duration: {total_time:.2f} seconds ({total_time/60:.2f} minutes)")
+                logger.info("")
+                logger.info("📊 STAGE 1 (GPT):")
+                logger.info(f"   Successful: {gpt_ok}")
+                logger.info(f"   Failed: {gpt_fail}")
+                logger.info(f"   Total: {gpt_ok + gpt_fail}")
+                logger.info("")
+                logger.info("📊 STAGE 2 (Claude):")
+                logger.info(f"   Successful: {claude_ok}")
+                logger.info(f"   Failed: {claude_fail}")
+                logger.info(f"   Total: {claude_ok + claude_fail}")
+                logger.info(f"   💰 Tokens: {in_tok:,} input + {out_tok:,} output = {in_tok + out_tok:,}")
+                logger.info("")
+                logger.info(f"📁 GPT contexts: {GPT_CONTEXTS_DIR}")
+                logger.info(f"📁 Final outputs: {CLAUDE_FINAL_DIR}")
+                logger.info("="*60)
+                return
 
+    # ============================================================
+    # TRADITIONAL MODE (Single Provider)
+    # ============================================================
+    
     # Batch mode: use Anthropic Message Batches API
     if provider == "claude" and not args.no_batch:
         batch_size = BATCH_SIZE_DEFAULT
@@ -2395,12 +3594,27 @@ def main() -> None:
             # Attempt ingestion for existing files unless disabled
             if not args.no_ingest:
                 ing_ok = trigger_ingestion(filepath, logger)
-                update_checkpoint(output_dir, row, ing_ok, load_checkpoint(output_dir))
+                update_checkpoint(output_dir, row, ing_ok, checkpoint_data)
                 if not ing_ok:
                     logger.warning("Marked as failed due to ingestion failure for existing file: %s", filename)
             else:
                 update_checkpoint(output_dir, row, True, checkpoint_data)
                 logger.info("Auto-ingest disabled via --no_ingest; marking existing file as completed: %s", filename)
+            
+            # Upload existing file to Google Drive
+            if ENABLE_DRIVE_UPLOAD:
+                try:
+                    upload_success = upload_file_to_drive(
+                        file_path=filepath,
+                        folder_id=TARGET_FOLDER_ID,
+                        logger=logger
+                    )
+                    if not upload_success:
+                        logger.warning("[sync][existing] Drive upload failed for %s", filename)
+                except Exception as e:
+                    logger.error("[sync][existing] Drive upload exception for %s: %s", filename, e)
+            else:
+                logger.info("[sync][existing] Drive upload disabled via ENABLE_DRIVE_UPLOAD flag")
             continue
         
         # Compute per-product debug base path early 
@@ -2426,21 +3640,32 @@ def main() -> None:
                     request_timeout=(30, 1800),
                 )
 
-                # Pre-clean: many providers wrap JSON in ```json fences; extract first JSON block if present
-                raw_for_parse = raw
-
+                # Use raw response text directly (same as batch mode)
+                json_text = raw.strip()
+                
+                # Save output JSON (same as batch mode: write raw text directly)
                 try:
-                    obj = json.loads(raw_for_parse)
-                except Exception:
-                    # If parsing fails for any reason, save RAW to main file (batch-parity behavior)
-                    obj = None
+                    with open(filepath, "w", encoding="utf-8") as out:
+                        try:
+                            # Try to parse and save clean JSON
+                            json.dump(json.loads(json_text), out, ensure_ascii=False, indent=2)
+                        except json.JSONDecodeError:
+                            # If parsing fails, write raw text as fallback
+                            out.write(json_text)
+                except Exception as e:
+                    logger.error("Failed to write output for %s: %s", filename, e)
+                    update_checkpoint(output_dir, row, False, checkpoint_data)
+                    session_fail += 1
+                    continue
 
-                # Save main product file (parsed JSON if available, else raw text)
-                with open(filepath, "w", encoding="utf-8") as out:
-                    if obj is not None:
-                        json.dump(obj, out, ensure_ascii=False, indent=2)
-                    else:
-                        out.write(raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False, indent=2))
+                # Write raw sidecar (same as batch mode: <base>.raw.result.txt)
+                try:
+                    base_no_ext = os.path.splitext(filename)[0]
+                    raw_result_txt_path = os.path.join(output_dir, f"{base_no_ext}.raw.result.txt")
+                    with open(raw_result_txt_path, "w", encoding="utf-8") as f_rawtxt:
+                        f_rawtxt.write(raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False, indent=2))
+                except Exception as _e:
+                    logger.debug("Failed to write raw result text sidecar for %s: %s", filename, _e)
 
                 # Trigger ingestion
                 ing_ok = True
@@ -2448,12 +3673,27 @@ def main() -> None:
                     ing_ok = trigger_ingestion(filepath, logger)
                 else:
                     logger.info("Auto-ingest disabled via --no_ingest; skipping ingestion for %s", filepath)
+                
+                # Upload to Google Drive
+                if ENABLE_DRIVE_UPLOAD:
+                    try:
+                        upload_success = upload_file_to_drive(
+                            file_path=filepath,
+                            folder_id=TARGET_FOLDER_ID,
+                            logger=logger
+                        )
+                        if not upload_success:
+                            logger.warning("[sync] Drive upload failed for %s", filename)
+                    except Exception as e:
+                        logger.error("[sync] Drive upload exception for %s: %s", filename, e)
+                else:
+                    logger.info("[sync] Drive upload disabled via ENABLE_DRIVE_UPLOAD flag")
                  
                 product_time = time.time() - product_start_time
                 session_ok += 1
                 
                 # Update checkpoint
-                update_checkpoint(output_dir, row, ing_ok, load_checkpoint(output_dir))
+                update_checkpoint(output_dir, row, ing_ok, checkpoint_data)
                 if not ing_ok:
                     logger.warning("Marked as failed due to ingestion failure: %s", filename)
                 
@@ -2474,7 +3714,7 @@ def main() -> None:
                     except Exception:
                         logger.debug("Failed to write unexpected error file for %s", debug_basepath)
                 session_fail += 1
-                update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
+                update_checkpoint(output_dir, row, False, checkpoint_data)
                 continue
         elif provider == "gpt":
             try:
@@ -2489,24 +3729,8 @@ def main() -> None:
                     system_text=prompt_text,
                 )
 
-                # Pre-clean: many providers wrap JSON in ```json fences; extract first JSON block if present
-                raw_for_parse = raw
-
-                try:
-                    obj = json.loads(raw_for_parse)
-                except Exception as e:
-                    # Attempt to extract JSON object if assistant added prose before/after
-                    cleaned = raw
-                    if cleaned is None:
-                        raise
-                    # Optionally write the cleaned JSON to debug
-                    if debug_basepath:
-                        try:
-                            with open(f"{debug_basepath}_response_text.cleaned.json", "w", encoding="utf-8") as f_clean:
-                                f_clean.write(cleaned)
-                        except Exception:
-                            logger.debug("Failed to write cleaned JSON for %s", debug_basepath)
-                    obj = json.loads(cleaned)
+                # Use raw response text directly (same as batch mode)
+                json_text = raw.strip()
                 
                 # Track usage
                 input_tokens = usage_info.get("input_tokens", 0)
@@ -2514,16 +3738,22 @@ def main() -> None:
                 total_input_tokens += input_tokens
                 total_output_tokens += output_tokens
                 
-                # Save file
-                with open(filepath, "w", encoding="utf-8") as out:
-                    try:
-                        # Try to parse and save clean JSON
-                        json.dump(obj, out, ensure_ascii=False, indent=2)
-                    except json.JSONDecodeError:
-                        # If parsing fails, write raw text as fallback
-                        out.write(raw)
+                # Save output JSON (same as batch mode: write raw text directly)
+                try:
+                    with open(filepath, "w", encoding="utf-8") as out:
+                        try:
+                            # Try to parse and save clean JSON
+                            json.dump(json.loads(json_text), out, ensure_ascii=False, indent=2)
+                        except json.JSONDecodeError:
+                            # If parsing fails, write raw text as fallback
+                            out.write(json_text)
+                except Exception as e:
+                    logger.error("Failed to write output for %s: %s", filename, e)
+                    update_checkpoint(output_dir, row, False, checkpoint_data)
+                    session_fail += 1
+                    continue
 
-                # Always write a raw sidecar like batch mode (<base>.raw.result.txt)
+                # Write raw sidecar (same as batch mode: <base>.raw.result.txt)
                 try:
                     base_no_ext = os.path.splitext(filename)[0]
                     raw_result_txt_path = os.path.join(output_dir, f"{base_no_ext}.raw.result.txt")
@@ -2532,26 +3762,33 @@ def main() -> None:
                 except Exception as _e:
                     logger.debug("Failed to write raw result text sidecar for %s: %s", filename, _e)
 
-                # Optional debug: save parsed JSON as well (duplicate of output for quick diff)
-                if debug_basepath:
-                    try:
-                        with open(f"{debug_basepath}_parsed.json", "w", encoding="utf-8") as f_parsed:
-                            json.dump(obj, f_parsed, ensure_ascii=False, indent=2)
-                    except Exception:
-                        logger.debug("Failed to write parsed JSON for %s", debug_basepath)
-
                 # Trigger ingestion
                 ing_ok = True
                 if not args.no_ingest:
                     ing_ok = trigger_ingestion(filepath, logger)
                 else:
                     logger.info("Auto-ingest disabled via --no_ingest; skipping ingestion for %s", filepath)
+                
+                # Upload to Google Drive
+                if ENABLE_DRIVE_UPLOAD:
+                    try:
+                        upload_success = upload_file_to_drive(
+                            file_path=filepath,
+                            folder_id=TARGET_FOLDER_ID,
+                            logger=logger
+                        )
+                        if not upload_success:
+                            logger.warning("[sync] Drive upload failed for %s", filename)
+                    except Exception as e:
+                        logger.error("[sync] Drive upload exception for %s: %s", filename, e)
+                else:
+                    logger.info("[sync] Drive upload disabled via ENABLE_DRIVE_UPLOAD flag")
                  
                 product_time = time.time() - product_start_time
                 session_ok += 1
                 
                 # Update checkpoint
-                update_checkpoint(output_dir, row, ing_ok, load_checkpoint(output_dir))
+                update_checkpoint(output_dir, row, ing_ok, checkpoint_data)
                 if not ing_ok:
                     logger.warning("Marked as failed due to ingestion failure: %s", filename)
                 
@@ -2563,40 +3800,6 @@ def main() -> None:
                 session_fail += 1
                 update_checkpoint(output_dir, row, False, checkpoint_data)
                 continue
-            except json.JSONDecodeError as jd:
-                logger.error(f"✗ Row {idx}: JSON decode error: {jd}")
-                logger.debug(f"Raw response: {raw[:500]}...")
-                # Persist raw LLM output to a sidecar file so we don't lose the response
-                try:
-                    base_no_ext = os.path.splitext(filename)[0]
-                    raw_sidecar_path = os.path.join(output_dir, f"{base_no_ext}.raw.json")
-                    sidecar_payload = {
-                        "raw_text": raw,
-                        "error": str(jd),
-                        "model": model,
-                        "product": {
-                            "brand": row.get("brand", ""),
-                            "product_name": row.get("product_name", ""),
-                            "shade_of_lipstick": row.get("shade_of_lipstick", ""),
-                            "sku": row.get("sku", "")
-                        },
-                        "timestamp": datetime.now().isoformat()
-                    }
-                    with open(raw_sidecar_path, "w", encoding="utf-8") as f_raw_out:
-                        json.dump(sidecar_payload, f_raw_out, ensure_ascii=False, indent=2)
-                    logger.info("Saved raw LLM output to %s", raw_sidecar_path)
-                except Exception as _:
-                    logger.debug("Failed to save raw sidecar file: %s", _)
-                if debug_basepath:
-                    try:
-                        with open(f"{debug_basepath}_json_error.txt", "w", encoding="utf-8") as f_jerr:
-                            f_jerr.write(str(jd) + "\n\n")
-                            f_jerr.write(raw)
-                    except Exception:
-                        logger.debug("Failed to write JSON error file for %s", debug_basepath)
-                session_fail += 1
-                update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
-                continue
             except Exception as e:
                 logger.error(f"✗ Row {idx}: Unexpected error: {e}")
                 if debug_basepath:
@@ -2606,7 +3809,7 @@ def main() -> None:
                     except Exception:
                         logger.debug("Failed to write unexpected error file for %s", debug_basepath)
                 session_fail += 1
-                update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
+                update_checkpoint(output_dir, row, False, checkpoint_data)
                 continue
 
     # Final statistics

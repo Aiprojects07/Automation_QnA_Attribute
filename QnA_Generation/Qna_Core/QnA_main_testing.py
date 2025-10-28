@@ -66,6 +66,10 @@ except Exception:  # SDK may not expose types; we'll fall back to plain dicts
     BatchRequest = None  # type: ignore
 from openai import OpenAI
 
+# Google Drive upload integration
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from google_drive_uploader import upload_file_to_drive, TARGET_FOLDER_ID
+
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 DEFAULT_MODEL = "claude-opus-4-1-20250805"  # From your example
 # Default batch size for Anthropic Message Batches (change here if needed)
@@ -76,8 +80,9 @@ DEFAULT_TEMPERATURE = 1
 # Control extra artifact creation without CLI args
 USE_EXCEL_DATA: bool = False
 ENABLE_THINKING: bool = True
-USE_CLAUDE: bool = True
-USE_GPT: bool = False
+USE_CLAUDE: bool = False
+USE_GPT: bool = True
+ENABLE_DRIVE_UPLOAD: bool = False
 
 # ------------------------------
 # Logging Setup
@@ -455,6 +460,9 @@ def run_batch_generation(
     ok, fail = 0, 0
     total_input_tokens, total_output_tokens = 0, 0
 
+    # Load checkpoint ONCE at function start to avoid race conditions
+    checkpoint_data = load_checkpoint(output_dir)
+
     shared_system = _build_shared_system_blocks(prompt_text, use_cache)
     try:
         logger.info("Prompt caching (batch): %s", "ENABLED" if use_cache else "DISABLED")
@@ -502,16 +510,31 @@ def run_batch_generation(
                 # Mark as successful in checkpoint (file exists means it was processed)
                 if not no_ingest:
                     ing_ok = trigger_ingestion(filepath, logger)
-                    update_checkpoint(output_dir, row, ing_ok, load_checkpoint(output_dir))
+                    update_checkpoint(output_dir, row, ing_ok, checkpoint_data)
                     if ing_ok:
                         ok += 1
                     else:
                         fail += 1
                         logger.warning("[batch] Marked as failed due to ingestion failure for existing file: %s", filename)
                 else:
-                    update_checkpoint(output_dir, row, True, load_checkpoint(output_dir))
+                    update_checkpoint(output_dir, row, True, checkpoint_data)
                     ok += 1
                     logger.info("[batch] Auto-ingest disabled; marking existing file as completed: %s", filename)
+                
+                # Upload existing file to Google Drive
+                if ENABLE_DRIVE_UPLOAD:
+                    try:
+                        upload_success = upload_file_to_drive(
+                            file_path=filepath,
+                            folder_id=TARGET_FOLDER_ID,
+                            logger=logger
+                        )
+                        if not upload_success:
+                            logger.warning("[batch][existing] Drive upload failed for %s", filename)
+                    except Exception as e:
+                        logger.error("[batch][existing] Drive upload exception for %s: %s", filename, e)
+                else:
+                    logger.info("[batch][existing] Drive upload disabled via ENABLE_DRIVE_UPLOAD flag")
             else:
                 wave_to_process.append(row)
         
@@ -569,9 +592,9 @@ def run_batch_generation(
             # Register this batch in tracker
             add_pending_batch(output_dir, batch_id, i+1, i+len(wave), wave_to_process)
 
-            # Poll until terminal status, but cap waiting time to 45 minutes per execution pool
+            # Poll until terminal status, but cap waiting time to 15 minutes per execution pool
             start_poll = time.time()
-            max_wait_seconds = 45 * 60  # 45 minutes
+            max_wait_seconds = 15 * 60  # 15 minutes
             timed_out = False
             while True:
                 status_obj = client.messages.batches.retrieve(batch_id)
@@ -647,7 +670,7 @@ def run_batch_generation(
                     # Update checkpoint for this row
                     row = next((r for r in wave if _make_custom_id(r) == custom_id), None)
                     if row:
-                        update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
+                        update_checkpoint(output_dir, row, False, checkpoint_data)
                     fail += 1
                     continue
 
@@ -756,7 +779,7 @@ def run_batch_generation(
                             _, user_text_resume = build_user_message(row, use_natural_generation=True)
                         except Exception as e_bum:
                             logger.error("[batch] Missing required fields for resume enqueue (%s): %s", custom_id, e_bum)
-                            update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
+                            update_checkpoint(output_dir, row, False, checkpoint_data)
                             fail += 1
                             continue
                         resume_queue.append({
@@ -773,7 +796,7 @@ def run_batch_generation(
                             _, user_text_resume = build_user_message(row, use_natural_generation=True)
                         except Exception as e_bum:
                             logger.error("[batch] Missing required fields for resume enqueue (no-parts) (%s): %s", custom_id, e_bum)
-                            update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
+                            update_checkpoint(output_dir, row, False, checkpoint_data)
                             fail += 1
                             continue
                         resume_queue.append({
@@ -808,7 +831,7 @@ def run_batch_generation(
                         pass
                 except Exception as e:
                     logger.error("Failed to parse batch item %s JSON: %s", custom_id, e)
-                    update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
+                    update_checkpoint(output_dir, row, False, checkpoint_data)
                     fail += 1
                     continue
 
@@ -823,7 +846,7 @@ def run_batch_generation(
                             out.write(json_text)
                 except Exception as e:
                     logger.error("Failed to write output for %s: %s", filename, e)
-                    update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
+                    update_checkpoint(output_dir, row, False, checkpoint_data)
                     fail += 1
                     continue
 
@@ -833,7 +856,23 @@ def run_batch_generation(
                     ing_ok = trigger_ingestion(filepath, logger)
                 else:
                     logger.info("Auto-ingest disabled via --no_ingest; skipping ingestion for %s", filepath)
-                update_checkpoint(output_dir, row, ing_ok, load_checkpoint(output_dir))
+                
+                # Upload to Google Drive
+                if ENABLE_DRIVE_UPLOAD:
+                    try:
+                        upload_success = upload_file_to_drive(
+                            file_path=filepath,
+                            folder_id=TARGET_FOLDER_ID,
+                            logger=logger
+                        )
+                        if not upload_success:
+                            logger.warning("[batch] Drive upload failed for %s", filename)
+                    except Exception as e:
+                        logger.error("[batch] Drive upload exception for %s: %s", filename, e)
+                else:
+                    logger.info("[batch] Drive upload disabled via ENABLE_DRIVE_UPLOAD flag")
+                
+                update_checkpoint(output_dir, row, ing_ok, checkpoint_data)
                 if ing_ok:
                     ok += 1
                 else:
@@ -919,7 +958,7 @@ def run_batch_generation(
                     logger.error("Resume batch submission failed: %s", e_res)
                     # Mark all queued items as failed in checkpoint and count as fail
                     for r in resume_queue:
-                        update_checkpoint(output_dir, r["row"], False, load_checkpoint(output_dir))
+                        update_checkpoint(output_dir, r["row"], False, checkpoint_data)
                         fail += 1
                     resume_queue = []
                     break
@@ -936,7 +975,7 @@ def run_batch_generation(
                         # mark fail
                         r = resume_map.get(custom_id_r)
                         if r:
-                            update_checkpoint(output_dir, r["row"], False, load_checkpoint(output_dir))
+                            update_checkpoint(output_dir, r["row"], False, checkpoint_data)
                             fail += 1
                         continue
                     message_r = getattr(result_obj_r, "message", None)
@@ -1052,7 +1091,7 @@ def run_batch_generation(
                             pass
                     except Exception as e:
                         logger.error("[resume] Failed to parse JSON for %s: %s", custom_id_r, e)
-                        update_checkpoint(output_dir, r_row, False, load_checkpoint(output_dir))
+                        update_checkpoint(output_dir, r_row, False, checkpoint_data)
                         fail += 1
                         continue
 
@@ -1067,7 +1106,7 @@ def run_batch_generation(
                             out.write(json_text_final)
                 except Exception as e_write:
                     logger.error("[resume] Failed to write output for %s: %s", filename, e_write)
-                    update_checkpoint(output_dir, r_row, False, load_checkpoint(output_dir))
+                    update_checkpoint(output_dir, r_row, False, checkpoint_data)
                     fail += 1
                     continue
 
@@ -1077,7 +1116,23 @@ def run_batch_generation(
                     ing_ok = trigger_ingestion(filepath, logger)
                 else:
                     logger.info("Auto-ingest disabled via --no_ingest; skipping ingestion for %s", filepath)
-                update_checkpoint(output_dir, r_row, ing_ok, load_checkpoint(output_dir))
+                
+                # Upload to Google Drive
+                if ENABLE_DRIVE_UPLOAD:
+                    try:
+                        upload_success = upload_file_to_drive(
+                            file_path=filepath,
+                            folder_id=TARGET_FOLDER_ID,
+                            logger=logger
+                        )
+                        if not upload_success:
+                            logger.warning("[batch][resume] Drive upload failed for %s", filename)
+                    except Exception as e:
+                        logger.error("[batch][resume] Drive upload exception for %s: %s", filename, e)
+                else:
+                    logger.info("[batch][resume] Drive upload disabled via ENABLE_DRIVE_UPLOAD flag")
+                
+                update_checkpoint(output_dir, r_row, ing_ok, checkpoint_data)
                 if ing_ok:
                     ok += 1
                 else:
@@ -1090,12 +1145,12 @@ def run_batch_generation(
             logger.error("Batch API error: %s", e)
             # Mark all rows in wave_to_process as failed in the checkpoint so reruns track them
             for row in wave_to_process:
-                update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
+                update_checkpoint(output_dir, row, False, checkpoint_data)
             fail += len(wave_to_process)
         except Exception as e:
             logger.error("Unexpected error during batch submission/processing: %s", e)
             for row in wave_to_process:
-                update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
+                update_checkpoint(output_dir, row, False, checkpoint_data)
             fail += len(wave_to_process)
     
     return ok, fail, total_input_tokens, total_output_tokens
@@ -1360,6 +1415,9 @@ def resume_pending_batches(
     client = Anthropic(api_key=api_key, default_headers={"anthropic-beta": "web-search-2025-03-05"})
     shared_system = _build_shared_system_blocks(prompt_text, use_cache)
     
+    # Load checkpoint ONCE at function start to avoid race conditions
+    checkpoint_data = load_checkpoint(output_dir)
+    
     ok, fail = 0, 0
     total_input_tokens, total_output_tokens = 0, 0
     
@@ -1427,7 +1485,7 @@ def resume_pending_batches(
                             "full_name": row_minimal.get("full_name", ""),
                             "s_no": row_minimal.get("s_no", ""),
                         }
-                        update_checkpoint(output_dir, full_row, False, load_checkpoint(output_dir))
+                        update_checkpoint(output_dir, full_row, False, checkpoint_data)
                     fail += 1
                     continue
                 
@@ -1523,7 +1581,7 @@ def resume_pending_batches(
                     
                 except Exception as e:
                     logger.error("[resume] Failed to parse JSON for %s: %s", custom_id, e)
-                    update_checkpoint(output_dir, full_row, False, load_checkpoint(output_dir))
+                    update_checkpoint(output_dir, full_row, False, checkpoint_data)
                     fail += 1
                     continue
                 
@@ -1536,7 +1594,7 @@ def resume_pending_batches(
                             out.write(text)
                 except Exception as e:
                     logger.error("[resume] Failed to write output for %s: %s", filename, e)
-                    update_checkpoint(output_dir, full_row, False, load_checkpoint(output_dir))
+                    update_checkpoint(output_dir, full_row, False, checkpoint_data)
                     fail += 1
                     continue
                 
@@ -1547,7 +1605,22 @@ def resume_pending_batches(
                 else:
                     logger.info("[resume] Auto-ingest disabled; skipping ingestion for %s", filepath)
                 
-                update_checkpoint(output_dir, full_row, ing_ok, load_checkpoint(output_dir))
+                # Upload to Google Drive
+                if ENABLE_DRIVE_UPLOAD:
+                    try:
+                        upload_success = upload_file_to_drive(
+                            file_path=filepath,
+                            folder_id=TARGET_FOLDER_ID,
+                            logger=logger
+                        )
+                        if not upload_success:
+                            logger.warning("[resume] Drive upload failed for %s", filename)
+                    except Exception as e:
+                        logger.error("[resume] Drive upload exception for %s: %s", filename, e)
+                else:
+                    logger.info("[resume] Drive upload disabled via ENABLE_DRIVE_UPLOAD flag")
+                
+                update_checkpoint(output_dir, full_row, ing_ok, checkpoint_data)
                 if ing_ok:
                     ok += 1
                 else:
@@ -1628,7 +1701,7 @@ def resume_pending_batches(
                 except Exception as e_res:
                     logger.error("[resume] Resume batch submission failed: %s", e_res)
                     for r in resume_queue:
-                        update_checkpoint(output_dir, r["row"], False, load_checkpoint(output_dir))
+                        update_checkpoint(output_dir, r["row"], False, checkpoint_data)
                         fail += 1
                     resume_queue = []
                     break
@@ -1644,7 +1717,7 @@ def resume_pending_batches(
                     if getattr(result_obj_r, "type", None) != "succeeded":
                         r = resume_map.get(custom_id_r)
                         if r:
-                            update_checkpoint(output_dir, r["row"], False, load_checkpoint(output_dir))
+                            update_checkpoint(output_dir, r["row"], False, checkpoint_data)
                             fail += 1
                         continue
                     message_r = getattr(result_obj_r, "message", None)
@@ -1731,7 +1804,7 @@ def resume_pending_batches(
                                 out.write(raw_for_parse_r)
                     except Exception as e_write:
                         logger.error("[resume] Failed to write output for %s: %s", filename_r, e_write)
-                        update_checkpoint(output_dir, r_row, False, load_checkpoint(output_dir))
+                        update_checkpoint(output_dir, r_row, False, checkpoint_data)
                         fail += 1
                         continue
                     ing_ok_r = True
@@ -1739,7 +1812,23 @@ def resume_pending_batches(
                         ing_ok_r = trigger_ingestion(filepath_r, logger)
                     else:
                         logger.info("[resume] Auto-ingest disabled; skipping ingestion for %s", filepath_r)
-                    update_checkpoint(output_dir, r_row, ing_ok_r, load_checkpoint(output_dir))
+                    
+                    # Upload to Google Drive
+                    if ENABLE_DRIVE_UPLOAD:
+                        try:
+                            upload_success = upload_file_to_drive(
+                                file_path=filepath_r,
+                                folder_id=TARGET_FOLDER_ID,
+                                logger=logger
+                            )
+                            if not upload_success:
+                                logger.warning("[resume][followup] Drive upload failed for %s", filename_r)
+                        except Exception as e:
+                            logger.error("[resume][followup] Drive upload exception for %s: %s", filename_r, e)
+                    else:
+                        logger.info("[resume][followup] Drive upload disabled via ENABLE_DRIVE_UPLOAD flag")
+                    
+                    update_checkpoint(output_dir, r_row, ing_ok_r, checkpoint_data)
                     if ing_ok_r:
                         ok += 1
                     else:
@@ -1758,7 +1847,7 @@ def resume_pending_batches(
                     "shade_of_lipstick": row_minimal.get("shade_of_lipstick", ""),
                     "sku": row_minimal.get("sku", "")
                 }
-                update_checkpoint(output_dir, full_row, False, load_checkpoint(output_dir))
+                update_checkpoint(output_dir, full_row, False, checkpoint_data)
             fail += len(rows_minimal)
     
     return ok, fail, total_input_tokens, total_output_tokens
@@ -2064,7 +2153,7 @@ def call_gpt_with_web_search(
     kwargs["text"] = {"verbosity": "high"}
     if enable_web_search:
         kwargs["tools"] = [{"type": "web_search"}]
-    kwargs["max_output_tokens"] = max_tokens
+    # max_output_tokens already set above
 
     t0 = time.time()
     resp = client.responses.create(**kwargs)
@@ -2141,7 +2230,7 @@ def main() -> None:
     except Exception:
         pass
     # Hardcoded file paths
-    prompt_path = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/data/beauty_prompt_final.json"
+    prompt_path = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/data/gpt_prompt.json"
     
     # Data source selection based on USE_EXCEL_DATA parameter
     if USE_EXCEL_DATA:
@@ -2287,19 +2376,33 @@ def main() -> None:
         logger.error(f"Failed to load configuration files: {e}")
         sys.exit(1)
 
-    # Filter out already completed products
+    # Filter out already completed products (check both checkpoint and file existence)
     remaining_rows = []
     skipped_checkpoint = 0
+    skipped_existing_files = 0
     
     for row in rows:
+        # Check checkpoint first
         if is_product_completed(row, checkpoint_data):
             skipped_checkpoint += 1
             logger.debug(f"Skipping already completed: {row['brand']} {row['product_name']} - {row['shade_of_lipstick']} (SKU: {row.get('sku', 'N/A')})")
-        else:
-            remaining_rows.append(row)
+            continue
+        
+        # Also check if output file already exists (even if marked as failed in checkpoint)
+        filename = create_output_filename(row)
+        filepath = os.path.join(output_dir, filename)
+        if os.path.exists(filepath):
+            skipped_existing_files += 1
+            logger.debug(f"Skipping existing file: {filename}")
+            continue
+        
+        # Neither completed in checkpoint nor file exists -> needs processing
+        remaining_rows.append(row)
     
     if skipped_checkpoint > 0:
         logger.info(f"🔄 Skipped {skipped_checkpoint} already completed products from checkpoint")
+    if skipped_existing_files > 0:
+        logger.info(f"📁 Skipped {skipped_existing_files} products with existing output files")
     
     logger.info(f"📊 Products to process: {len(remaining_rows)} (out of {len(rows)} total)")
 
@@ -2395,12 +2498,27 @@ def main() -> None:
             # Attempt ingestion for existing files unless disabled
             if not args.no_ingest:
                 ing_ok = trigger_ingestion(filepath, logger)
-                update_checkpoint(output_dir, row, ing_ok, load_checkpoint(output_dir))
+                update_checkpoint(output_dir, row, ing_ok, checkpoint_data)
                 if not ing_ok:
                     logger.warning("Marked as failed due to ingestion failure for existing file: %s", filename)
             else:
                 update_checkpoint(output_dir, row, True, checkpoint_data)
                 logger.info("Auto-ingest disabled via --no_ingest; marking existing file as completed: %s", filename)
+            
+            # Upload existing file to Google Drive
+            if ENABLE_DRIVE_UPLOAD:
+                try:
+                    upload_success = upload_file_to_drive(
+                        file_path=filepath,
+                        folder_id=TARGET_FOLDER_ID,
+                        logger=logger
+                    )
+                    if not upload_success:
+                        logger.warning("[sync][existing] Drive upload failed for %s", filename)
+                except Exception as e:
+                    logger.error("[sync][existing] Drive upload exception for %s: %s", filename, e)
+            else:
+                logger.info("[sync][existing] Drive upload disabled via ENABLE_DRIVE_UPLOAD flag")
             continue
         
         # Compute per-product debug base path early 
@@ -2426,21 +2544,32 @@ def main() -> None:
                     request_timeout=(30, 1800),
                 )
 
-                # Pre-clean: many providers wrap JSON in ```json fences; extract first JSON block if present
-                raw_for_parse = raw
-
+                # Use raw response text directly (same as batch mode)
+                json_text = raw.strip()
+                
+                # Save output JSON (same as batch mode: write raw text directly)
                 try:
-                    obj = json.loads(raw_for_parse)
-                except Exception:
-                    # If parsing fails for any reason, save RAW to main file (batch-parity behavior)
-                    obj = None
+                    with open(filepath, "w", encoding="utf-8") as out:
+                        try:
+                            # Try to parse and save clean JSON
+                            json.dump(json.loads(json_text), out, ensure_ascii=False, indent=2)
+                        except json.JSONDecodeError:
+                            # If parsing fails, write raw text as fallback
+                            out.write(json_text)
+                except Exception as e:
+                    logger.error("Failed to write output for %s: %s", filename, e)
+                    update_checkpoint(output_dir, row, False, checkpoint_data)
+                    session_fail += 1
+                    continue
 
-                # Save main product file (parsed JSON if available, else raw text)
-                with open(filepath, "w", encoding="utf-8") as out:
-                    if obj is not None:
-                        json.dump(obj, out, ensure_ascii=False, indent=2)
-                    else:
-                        out.write(raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False, indent=2))
+                # Write raw sidecar (same as batch mode: <base>.raw.result.txt)
+                try:
+                    base_no_ext = os.path.splitext(filename)[0]
+                    raw_result_txt_path = os.path.join(output_dir, f"{base_no_ext}.raw.result.txt")
+                    with open(raw_result_txt_path, "w", encoding="utf-8") as f_rawtxt:
+                        f_rawtxt.write(raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False, indent=2))
+                except Exception as _e:
+                    logger.debug("Failed to write raw result text sidecar for %s: %s", filename, _e)
 
                 # Trigger ingestion
                 ing_ok = True
@@ -2448,12 +2577,27 @@ def main() -> None:
                     ing_ok = trigger_ingestion(filepath, logger)
                 else:
                     logger.info("Auto-ingest disabled via --no_ingest; skipping ingestion for %s", filepath)
+                
+                # Upload to Google Drive
+                if ENABLE_DRIVE_UPLOAD:
+                    try:
+                        upload_success = upload_file_to_drive(
+                            file_path=filepath,
+                            folder_id=TARGET_FOLDER_ID,
+                            logger=logger
+                        )
+                        if not upload_success:
+                            logger.warning("[sync] Drive upload failed for %s", filename)
+                    except Exception as e:
+                        logger.error("[sync] Drive upload exception for %s: %s", filename, e)
+                else:
+                    logger.info("[sync] Drive upload disabled via ENABLE_DRIVE_UPLOAD flag")
                  
                 product_time = time.time() - product_start_time
                 session_ok += 1
                 
                 # Update checkpoint
-                update_checkpoint(output_dir, row, ing_ok, load_checkpoint(output_dir))
+                update_checkpoint(output_dir, row, ing_ok, checkpoint_data)
                 if not ing_ok:
                     logger.warning("Marked as failed due to ingestion failure: %s", filename)
                 
@@ -2474,7 +2618,7 @@ def main() -> None:
                     except Exception:
                         logger.debug("Failed to write unexpected error file for %s", debug_basepath)
                 session_fail += 1
-                update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
+                update_checkpoint(output_dir, row, False, checkpoint_data)
                 continue
         elif provider == "gpt":
             try:
@@ -2489,24 +2633,8 @@ def main() -> None:
                     system_text=prompt_text,
                 )
 
-                # Pre-clean: many providers wrap JSON in ```json fences; extract first JSON block if present
-                raw_for_parse = raw
-
-                try:
-                    obj = json.loads(raw_for_parse)
-                except Exception as e:
-                    # Attempt to extract JSON object if assistant added prose before/after
-                    cleaned = raw
-                    if cleaned is None:
-                        raise
-                    # Optionally write the cleaned JSON to debug
-                    if debug_basepath:
-                        try:
-                            with open(f"{debug_basepath}_response_text.cleaned.json", "w", encoding="utf-8") as f_clean:
-                                f_clean.write(cleaned)
-                        except Exception:
-                            logger.debug("Failed to write cleaned JSON for %s", debug_basepath)
-                    obj = json.loads(cleaned)
+                # Use raw response text directly (same as batch mode)
+                json_text = raw.strip()
                 
                 # Track usage
                 input_tokens = usage_info.get("input_tokens", 0)
@@ -2514,16 +2642,22 @@ def main() -> None:
                 total_input_tokens += input_tokens
                 total_output_tokens += output_tokens
                 
-                # Save file
-                with open(filepath, "w", encoding="utf-8") as out:
-                    try:
-                        # Try to parse and save clean JSON
-                        json.dump(obj, out, ensure_ascii=False, indent=2)
-                    except json.JSONDecodeError:
-                        # If parsing fails, write raw text as fallback
-                        out.write(raw)
+                # Save output JSON (same as batch mode: write raw text directly)
+                try:
+                    with open(filepath, "w", encoding="utf-8") as out:
+                        try:
+                            # Try to parse and save clean JSON
+                            json.dump(json.loads(json_text), out, ensure_ascii=False, indent=2)
+                        except json.JSONDecodeError:
+                            # If parsing fails, write raw text as fallback
+                            out.write(json_text)
+                except Exception as e:
+                    logger.error("Failed to write output for %s: %s", filename, e)
+                    update_checkpoint(output_dir, row, False, checkpoint_data)
+                    session_fail += 1
+                    continue
 
-                # Always write a raw sidecar like batch mode (<base>.raw.result.txt)
+                # Write raw sidecar (same as batch mode: <base>.raw.result.txt)
                 try:
                     base_no_ext = os.path.splitext(filename)[0]
                     raw_result_txt_path = os.path.join(output_dir, f"{base_no_ext}.raw.result.txt")
@@ -2532,26 +2666,33 @@ def main() -> None:
                 except Exception as _e:
                     logger.debug("Failed to write raw result text sidecar for %s: %s", filename, _e)
 
-                # Optional debug: save parsed JSON as well (duplicate of output for quick diff)
-                if debug_basepath:
-                    try:
-                        with open(f"{debug_basepath}_parsed.json", "w", encoding="utf-8") as f_parsed:
-                            json.dump(obj, f_parsed, ensure_ascii=False, indent=2)
-                    except Exception:
-                        logger.debug("Failed to write parsed JSON for %s", debug_basepath)
-
                 # Trigger ingestion
                 ing_ok = True
                 if not args.no_ingest:
                     ing_ok = trigger_ingestion(filepath, logger)
                 else:
                     logger.info("Auto-ingest disabled via --no_ingest; skipping ingestion for %s", filepath)
+                
+                # Upload to Google Drive
+                if ENABLE_DRIVE_UPLOAD:
+                    try:
+                        upload_success = upload_file_to_drive(
+                            file_path=filepath,
+                            folder_id=TARGET_FOLDER_ID,
+                            logger=logger
+                        )
+                        if not upload_success:
+                            logger.warning("[sync] Drive upload failed for %s", filename)
+                    except Exception as e:
+                        logger.error("[sync] Drive upload exception for %s: %s", filename, e)
+                else:
+                    logger.info("[sync] Drive upload disabled via ENABLE_DRIVE_UPLOAD flag")
                  
                 product_time = time.time() - product_start_time
                 session_ok += 1
                 
                 # Update checkpoint
-                update_checkpoint(output_dir, row, ing_ok, load_checkpoint(output_dir))
+                update_checkpoint(output_dir, row, ing_ok, checkpoint_data)
                 if not ing_ok:
                     logger.warning("Marked as failed due to ingestion failure: %s", filename)
                 
@@ -2563,40 +2704,6 @@ def main() -> None:
                 session_fail += 1
                 update_checkpoint(output_dir, row, False, checkpoint_data)
                 continue
-            except json.JSONDecodeError as jd:
-                logger.error(f"✗ Row {idx}: JSON decode error: {jd}")
-                logger.debug(f"Raw response: {raw[:500]}...")
-                # Persist raw LLM output to a sidecar file so we don't lose the response
-                try:
-                    base_no_ext = os.path.splitext(filename)[0]
-                    raw_sidecar_path = os.path.join(output_dir, f"{base_no_ext}.raw.json")
-                    sidecar_payload = {
-                        "raw_text": raw,
-                        "error": str(jd),
-                        "model": model,
-                        "product": {
-                            "brand": row.get("brand", ""),
-                            "product_name": row.get("product_name", ""),
-                            "shade_of_lipstick": row.get("shade_of_lipstick", ""),
-                            "sku": row.get("sku", "")
-                        },
-                        "timestamp": datetime.now().isoformat()
-                    }
-                    with open(raw_sidecar_path, "w", encoding="utf-8") as f_raw_out:
-                        json.dump(sidecar_payload, f_raw_out, ensure_ascii=False, indent=2)
-                    logger.info("Saved raw LLM output to %s", raw_sidecar_path)
-                except Exception as _:
-                    logger.debug("Failed to save raw sidecar file: %s", _)
-                if debug_basepath:
-                    try:
-                        with open(f"{debug_basepath}_json_error.txt", "w", encoding="utf-8") as f_jerr:
-                            f_jerr.write(str(jd) + "\n\n")
-                            f_jerr.write(raw)
-                    except Exception:
-                        logger.debug("Failed to write JSON error file for %s", debug_basepath)
-                session_fail += 1
-                update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
-                continue
             except Exception as e:
                 logger.error(f"✗ Row {idx}: Unexpected error: {e}")
                 if debug_basepath:
@@ -2606,7 +2713,7 @@ def main() -> None:
                     except Exception:
                         logger.debug("Failed to write unexpected error file for %s", debug_basepath)
                 session_fail += 1
-                update_checkpoint(output_dir, row, False, load_checkpoint(output_dir))
+                update_checkpoint(output_dir, row, False, checkpoint_data)
                 continue
 
     # Final statistics

@@ -29,6 +29,9 @@ TOKEN_FILE = BASE_DIR / "token.pickle"
 # ----GPt Output File Path # Folder: https://drive.google.com/drive/folders/1_dJUqPIptoH6Yfbr6VXI0urZzlO6_QOC?usp=sharing
 TARGET_FOLDER_ID = "1_dJUqPIptoH6Yfbr6VXI0urZzlO6_QOC"
 
+# # Claude And Gpt output folder
+# # ----Claude Output File Path # Folder: https://drive.google.com/drive/folders/1LH1pRktS6Sds3Wo_kNs33QlMUZBGBpgP?usp=sharing
+# TARGET_FOLDER_ID = "1LH1pRktS6Sds3Wo_kNs33QlMUZBGBpgP"
 
 def get_drive_service():
     """Authenticate and return Google Drive service instance.
@@ -165,7 +168,7 @@ def upload_file_to_drive(
     folder_name: Optional[str] = None,
     folder_id: Optional[str] = None,
     logger: Optional[logging.Logger] = None,
-    replace_existing: bool = True
+    replace_existing: bool = False
 ) -> bool:
     """Upload a file to Google Drive, optionally replacing existing files with same name.
     
@@ -206,12 +209,17 @@ def upload_file_to_drive(
         file_name = os.path.basename(file_path)
         media = MediaFileUpload(file_path, resumable=True)
         
-        # Check if file already exists in the folder
+        # Check if file already exists in the folder (avoid duplicates)
         existing_file_id = None
-        if replace_existing and parent_id:
+        if parent_id:
             existing_file_id = find_file_in_folder(service, file_name, parent_id)
-        
-        if existing_file_id:
+
+        if existing_file_id and not replace_existing:
+            # Skip upload if file exists and we should not replace
+            logger.info(f"⏭️  Skipping upload; file already exists in Drive: {file_name} (ID: {existing_file_id})")
+            return True
+
+        if existing_file_id and replace_existing:
             # Update existing file (replace content)
             logger.info(f"📄 File exists in Drive: {file_name} (ID: {existing_file_id})")
             logger.info(f"🔄 Replacing existing file with updated content...")

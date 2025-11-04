@@ -1,5 +1,9 @@
 # Always check drive folder for new files, prompt_path, excel sheet, Use_GPT, Use_Claude, Use_Excel, Enable_Drive_Upload, 
-#  For gpt only: --gpt_only, For claude only: --claude_only
+#  For gpt only: --gpt_only, For claude only: --claude_only 
+# Time in batch processing
+# Always check output folder paths for both claude and gpt
+## Always update checpoint stage 
+## Pinecone key in .env
 
 #!/usr/bin/env python3
 """
@@ -90,6 +94,18 @@ USE_CLAUDE: bool = True
 USE_GPT: bool = False
 ENABLE_DRIVE_UPLOAD: bool = False
 
+# Category-scoped checkpointing
+# Update this variable before execution to switch category-specific checkpoints
+# DEFAULT_CATEGORY: str = "Lip_balm_and_Treatments"
+DEFAULT_CATEGORY: str = "Lip_Balm_and_Treatment"
+
+# Current stage for outputs checkpointing ('gpt' or 'claude').
+# This is set at runtime after determining provider/flags.
+CURRENT_CHECKPOINT_STAGE: str = "claude"
+
+# Centralized checkpoint directory (shared for GPT and Claude stage checkpoints)
+CHECKPOINT_BASE_DIR: str = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/checkpoint"
+
 # ------------------------------
 # 2-Stage Pipeline Configuration
 # ------------------------------
@@ -97,14 +113,14 @@ ENABLE_DRIVE_UPLOAD: bool = False
 ENABLE_PIPELINE_MODE: bool = False
 
 # Stage 1: GPT parallel processing output directory
-GPT_CONTEXTS_DIR = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/Gpt_Output"
+GPT_CONTEXTS_DIR = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/Gpt_Output_Lipstick"
 
 # Stage 2: Claude final output directory
-CLAUDE_FINAL_DIR = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/output"
+CLAUDE_FINAL_DIR = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/Claude_Output_Lip_Balm_and_Treatments"
 
 # Pipeline settings
 GPT_PARALLEL_WORKERS = 5 # Number of parallel GPT threads (10-15 recommended)
-CLAUDE_BATCH_TRIGGER_SIZE = 3  # Trigger Claude batch when this many GPT outputs are ready
+CLAUDE_BATCH_TRIGGER_SIZE = 3 # Trigger Claude batch when this many GPT outputs are ready
 GPT_MAX_RETRIES = 2  # Max retries for GPT API calls
 CLAUDE_POLL_INTERVAL = 5  # Seconds between checking for new GPT outputs
 
@@ -112,10 +128,12 @@ CLAUDE_POLL_INTERVAL = 5  # Seconds between checking for new GPT outputs
 # Logging Setup
 # ------------------------------
 
+
+
 def setup_logging(output_dir: str) -> logging.Logger:
     """Setup logging configuration with both file and console handlers."""
-    # Create logs directory
-    log_dir = os.path.join(output_dir, "logs")
+    # Create logs directory (fixed, centralized path)
+    log_dir = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/logs"
     os.makedirs(log_dir, exist_ok=True)
     
     # Create log filename with timestamp
@@ -352,6 +370,8 @@ def read_rows(data_path: str) -> List[Dict[str, str]]:
 def sanitize_filename(text: str) -> str:
     """Convert text to a safe filename by removing/replacing problematic characters."""
     import re
+    if text is None:
+        text = ""
     # Replace spaces and problematic characters with hyphens
     text = re.sub(r'[^\w\s-]', '', text)  # Remove special chars except word chars, spaces, hyphens
     text = re.sub(r'[-\s]+', '-', text)   # Replace multiple spaces/hyphens with single hyphen
@@ -363,12 +383,18 @@ def create_output_filename(product_row: Dict[str, str]) -> str:
     sku = sanitize_filename(product_row.get("sku", "")) if product_row.get("sku") else ""
     brand = sanitize_filename(product_row["brand"])
     product_name = sanitize_filename(product_row["product_name"])
-    shade = sanitize_filename(product_row["shade_of_lipstick"])
+    # Shade is optional (e.g., for lip balms/treatments). Try multiple keys; omit if empty.
+    shade_raw = product_row.get("shade_of_lipstick") or product_row.get("shade") or product_row.get("color") or ""
+    shade = sanitize_filename(shade_raw)
     
     if sku:
-        return f"{sku}-{brand}-{product_name}-{shade}.json"
+        if shade:
+            return f"{sku}-{brand}-{product_name}-{shade}.json"
+        return f"{sku}-{brand}-{product_name}.json"
     else:
-        return f"{brand}-{product_name}-{shade}.json"
+        if shade:
+            return f"{brand}-{product_name}-{shade}.json"
+        return f"{brand}-{product_name}.json"
 
 
 def trigger_ingestion(json_path: str, logger: logging.Logger) -> bool:
@@ -378,7 +404,7 @@ def trigger_ingestion(json_path: str, logger: logging.Logger) -> bool:
     try:
         env = os.environ.copy()
         env["FILE_PATH"] = json_path
-        script_path = "/home/sid/Documents/Automation_QnA_Attribute/clustering_Pinecone/pinecone_core/clustering_upserting.py"
+        script_path = "/home/sid/Documents/Automation_QnA_Attribute/clustering_Pinecone/pinecone_core/Lipstick_QnA_Upserting.py"
         logger.info(f"Triggering ingestion for: {json_path}")
         result = subprocess.run([sys.executable, script_path], env=env, capture_output=True, text=True)
         if result.returncode != 0:
@@ -443,6 +469,8 @@ def _build_shared_system_blocks(prompt_text: str, use_cache: bool) -> List[Dict[
             - If you have not finished generating the full JSON, do NOT return partial JSON; instead return nothing and wait for resume.
             - Before returning, ensure the JSON contains no angle-bracket tags (e.g., <cite ...>), no 'index=' attributes, no bracketed numbers like [1] or (1), and no URLs.
             - If any such markers appear in your draft, rewrite those lines to keep only the information and remove the markers before returning.
+            - Absolutely remove any markdown links or inline URLs from string values. If a value contains a pattern like [Text](https://example.com) or (https://example.com), keep only the plain text 'Text' and drop the URL entirely.
+            - Ensure all internal double quotes inside JSON string values are escaped with a backslash. For example, if a value needs quotes like He said "Burnt Pumpkin", output "He said \\"Burnt Pumpkin\\"" in JSON.
             """
         ).strip(),
     }
@@ -618,7 +646,7 @@ def run_batch_generation(
 
             # Poll until terminal status, but cap waiting time to 15 minutes per execution pool
             start_poll = time.time()
-            max_wait_seconds = 5 * 60  # 5 minutes
+            max_wait_seconds = 3 * 60  # 5 minutes
             timed_out = False
             while True:
                 status_obj = client.messages.batches.retrieve(batch_id)
@@ -908,6 +936,8 @@ def run_batch_generation(
 
             # Process resume_queue in parallel via batch waves until all are terminal
             while resume_queue:
+                # Ensure next_round is always defined even if an exception occurs before assignment
+                next_round: List[Dict[str, Any]] = []
                 try:
                     logger.info("Starting resume batch for %s items", len(resume_queue))
                 except Exception:
@@ -989,7 +1019,6 @@ def run_batch_generation(
 
                 # Map custom_id to queue entry for quick access
                 resume_map = {r["custom_id"]: r for r in resume_queue}
-                next_round: List[Dict[str, Any]] = []
 
                 # Process each resume item
                 for item_r in resume_items:
@@ -1169,12 +1198,18 @@ def run_batch_generation(
             logger.error("Batch API error: %s", e)
             # Mark all rows in wave_to_process as failed in the checkpoint so reruns track them
             for row in wave_to_process:
-                update_checkpoint(output_dir, row, False, checkpoint_data)
+                _pid = f"{(row.get('brand') or '').strip()}_{(row.get('product_name') or '').strip()}_{(row.get('shade_of_lipstick') or '').strip()}_{(row.get('sku') or '').strip()}"
+                _last = (checkpoint_data.get("product_status") or {}).get(_pid)
+                if _last != "fail":
+                    update_checkpoint(output_dir, row, False, checkpoint_data)
             fail += len(wave_to_process)
         except Exception as e:
             logger.error("Unexpected error during batch submission/processing: %s", e)
             for row in wave_to_process:
-                update_checkpoint(output_dir, row, False, checkpoint_data)
+                _pid = f"{(row.get('brand') or '').strip()}_{(row.get('product_name') or '').strip()}_{(row.get('shade_of_lipstick') or '').strip()}_{(row.get('sku') or '').strip()}"
+                _last = (checkpoint_data.get("product_status") or {}).get(_pid)
+                if _last != "fail":
+                    update_checkpoint(output_dir, row, False, checkpoint_data)
             fail += len(wave_to_process)
     
     return ok, fail, total_input_tokens, total_output_tokens
@@ -1227,25 +1262,64 @@ def setup_pipeline_directories() -> Dict[str, str]:
     dirs = {
         "gpt_contexts": GPT_CONTEXTS_DIR,
         "claude_final": CLAUDE_FINAL_DIR,
-        "logs": os.path.join(CLAUDE_FINAL_DIR, "logs"),
-        "checkpoint": os.path.join(CLAUDE_FINAL_DIR, "checkpoint"),
+        "logs": "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/logs",
+        # Note: Stage checkpoints are centralized under CHECKPOINT_BASE_DIR
+        # Use centralized checkpoint directory for all stages
+        "checkpoint": CHECKPOINT_BASE_DIR,
     }
     
     # Create all directories
     for name, path in dirs.items():
         os.makedirs(path, exist_ok=True)
+    # Ensure centralized checkpoint directory exists
+    try:
+        os.makedirs(CHECKPOINT_BASE_DIR, exist_ok=True)
+    except Exception:
+        pass
     
     return dirs
 
 
+def _sanitize_category(name: str) -> str:
+    """Sanitize category name for safe filenames."""
+    try:
+        return sanitize_filename(name) if name else "default"
+    except Exception:
+        return "default"
+
+
 def get_gpt_checkpoint_path() -> str:
-    """Get path to the GPT stage checkpoint file."""
-    return os.path.join(CLAUDE_FINAL_DIR, "checkpoint", "checkpoint_gpt.json")
+    """Get path to the GPT stage checkpoint file (category-scoped)."""
+    category_safe = _sanitize_category(DEFAULT_CATEGORY)
+    # Example: /.../QnA_Generation/checkpoint/checkpoint_gpt_lipstick.json
+    path = os.path.join(CHECKPOINT_BASE_DIR, f"checkpoint_gpt_{category_safe}.json")
+    # Ensure parent dir exists
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return path
 
 
-def get_claude_checkpoint_path() -> str:
-    """Get path to the Claude stage checkpoint file."""
-    return os.path.join(CLAUDE_FINAL_DIR, "checkpoint", "checkpoint_claude.json")
+## Deprecated: legacy Claude checkpoint helpers removed. The pipeline now uses
+## get_outputs_checkpoint_path()/load_checkpoint()/save_checkpoint()/update_checkpoint().
+
+
+def get_batch_tracker_path() -> str:
+    """Get path to the centralized, category-scoped batch tracker file."""
+    category_safe = _sanitize_category(DEFAULT_CATEGORY)
+    # Example: /.../QnA_Generation/checkpoint/batch_tracker_lipstick.json
+    path = os.path.join(CHECKPOINT_BASE_DIR, f"batch_tracker_{category_safe}.json")
+    # Ensure parent dir exists
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return path
+
+
+def get_outputs_checkpoint_path() -> str:
+    """Get path to the centralized, category-scoped outputs checkpoint file.
+    Simplified: we only persist outputs checkpoint for Claude runs.
+    """
+    category_safe = _sanitize_category(DEFAULT_CATEGORY)
+    path = os.path.join(CHECKPOINT_BASE_DIR, f"checkpoint_outputs_claude_{category_safe}.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return path
 
 
 # ------------------------------
@@ -1290,8 +1364,24 @@ def save_gpt_checkpoint(checkpoint_data: Dict[str, Any]) -> None:
     """Save GPT stage checkpoint data."""
     checkpoint_file = get_gpt_checkpoint_path()
     checkpoint_copy = checkpoint_data.copy()
-    checkpoint_copy["completed_skus"] = list(checkpoint_copy.get("completed_skus", set()))
-    checkpoint_copy["failed_skus"] = list(checkpoint_copy.get("failed_skus", set()))
+    # Ensure sets exist
+    completed_set = checkpoint_copy.get("completed_skus", set()) or set()
+    failed_set = checkpoint_copy.get("failed_skus", set()) or set()
+    if isinstance(completed_set, list):
+        completed_set = set(completed_set)
+    if isinstance(failed_set, list):
+        failed_set = set(failed_set)
+
+    # Recompute counters from sets to reflect current state (unique SKUs)
+    successful_count = len(completed_set)
+    failed_count = len(failed_set)
+    total_count = successful_count + failed_count
+
+    checkpoint_copy["completed_skus"] = list(completed_set)
+    checkpoint_copy["failed_skus"] = list(failed_set)
+    checkpoint_copy["successful"] = successful_count
+    checkpoint_copy["failed"] = failed_count
+    checkpoint_copy["total_processed"] = total_count
     checkpoint_copy["last_updated"] = datetime.now().isoformat()
     
     try:
@@ -1321,70 +1411,13 @@ def is_gpt_completed(sku: str, checkpoint_data: Dict[str, Any]) -> bool:
     return sku in checkpoint_data.get("completed_skus", set())
 
 
-def load_claude_checkpoint() -> Dict[str, Any]:
-    """Load Claude stage checkpoint data.
-    Tracks which products have final Claude output.
-    """
-    checkpoint_file = get_claude_checkpoint_path()
-    
-    if os.path.exists(checkpoint_file):
-        try:
-            with open(checkpoint_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                data.setdefault("completed_skus", [])
-                data.setdefault("failed_skus", [])
-                data.setdefault("total_processed", 0)
-                data.setdefault("successful", 0)
-                data.setdefault("failed", 0)
-                data.setdefault("last_updated", None)
-                data.setdefault("batches_processed", [])
-                
-                # Convert to sets
-                data["completed_skus"] = set(data["completed_skus"])
-                data["failed_skus"] = set(data["failed_skus"])
-                return data
-        except Exception as e:
-            logging.getLogger(__name__).warning(f"Failed to load Claude checkpoint: {e}")
-    
-    return {
-        "completed_skus": set(),
-        "failed_skus": set(),
-        "total_processed": 0,
-        "successful": 0,
-        "failed": 0,
-        "last_updated": None,
-        "batches_processed": []
-    }
+## load_claude_checkpoint() removed; use load_checkpoint() instead.
 
 
-def save_claude_checkpoint(checkpoint_data: Dict[str, Any]) -> None:
-    """Save Claude stage checkpoint data."""
-    checkpoint_file = get_claude_checkpoint_path()
-    checkpoint_copy = checkpoint_data.copy()
-    checkpoint_copy["completed_skus"] = list(checkpoint_copy.get("completed_skus", set()))
-    checkpoint_copy["failed_skus"] = list(checkpoint_copy.get("failed_skus", set()))
-    checkpoint_copy["last_updated"] = datetime.now().isoformat()
-    
-    try:
-        with open(checkpoint_file, "w", encoding="utf-8") as f:
-            json.dump(checkpoint_copy, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logging.getLogger(__name__).error(f"Failed to save Claude checkpoint: {e}")
+## save_claude_checkpoint() removed; use save_checkpoint().
 
 
-def update_claude_checkpoint(sku: str, success: bool, checkpoint_data: Dict[str, Any]) -> None:
-    """Update Claude checkpoint after processing a product."""
-    if success:
-        checkpoint_data.setdefault("completed_skus", set()).add(sku)
-        checkpoint_data.setdefault("failed_skus", set()).discard(sku)
-        checkpoint_data["successful"] = checkpoint_data.get("successful", 0) + 1
-    else:
-        checkpoint_data.setdefault("failed_skus", set()).add(sku)
-        checkpoint_data.setdefault("completed_skus", set()).discard(sku)
-        checkpoint_data["failed"] = checkpoint_data.get("failed", 0) + 1
-    
-    checkpoint_data["total_processed"] = checkpoint_data.get("total_processed", 0) + 1
-    save_claude_checkpoint(checkpoint_data)
+## update_claude_checkpoint() removed; use update_checkpoint() to mutate and save.
 
 
 def is_claude_completed(sku: str, checkpoint_data: Dict[str, Any]) -> bool:
@@ -1660,7 +1693,7 @@ def load_gpt_contexts_into_rows(
 
 def run_claude_scheduler(
     all_rows: List[Dict[str, str]],
-    prompt_text: str,
+    claude_prompt: str,
     anthropic_api_key: str,
     claude_model: str,
     logger: logging.Logger,
@@ -1701,8 +1734,18 @@ def run_claude_scheduler(
         logger.info("[CLAUDE SCHEDULER] No products ready for Claude processing")
         return 0, 0, 0, 0
     
-    # Load Claude checkpoint
-    claude_checkpoint = load_claude_checkpoint()
+    # Load centralized outputs checkpoint (category-scoped)
+    # This ensures we use the same checkpoint the main pipeline updates:
+    #   /checkpoint/checkpoint_outputs_claude_<category>.json
+    claude_checkpoint = load_checkpoint(CLAUDE_FINAL_DIR)
+    try:
+        logger.info(
+            "[CLAUDE SCHEDULER] Using outputs checkpoint: completed=%s, failed=%s",
+            len(claude_checkpoint.get("completed_skus", set()) or set()),
+            len(claude_checkpoint.get("failed_skus", set()) or set()),
+        )
+    except Exception:
+        pass
     
     # Filter out already completed products
     remaining_rows = []
@@ -1735,7 +1778,7 @@ def run_claude_scheduler(
                 api_key=anthropic_api_key,
                 model=claude_model,
                 rows=batch,
-                prompt_text=prompt_text,
+                prompt_text=claude_prompt,
                 max_tokens=max_tokens,
                 batch_size=len(batch),
                 output_dir=CLAUDE_FINAL_DIR,
@@ -1828,7 +1871,7 @@ def gpt_worker_with_queue(
 
 
 def claude_watcher(
-    prompt_text: str,
+    claude_prompt: str,
     anthropic_api_key: str,
     claude_model: str,
     logger: logging.Logger,
@@ -1881,7 +1924,7 @@ def claude_watcher(
                             api_key=anthropic_api_key,
                             model=claude_model,
                             rows=buffer,
-                            prompt_text=prompt_text,
+                            prompt_text=claude_prompt,
                             max_tokens=max_tokens,
                             batch_size=len(buffer),
                             output_dir=CLAUDE_FINAL_DIR,
@@ -1917,7 +1960,7 @@ def claude_watcher(
                     api_key=anthropic_api_key,
                     model=claude_model,
                     rows=buffer,
-                    prompt_text=prompt_text,
+                    prompt_text=claude_prompt,
                     max_tokens=max_tokens,
                     batch_size=len(buffer),
                     output_dir=CLAUDE_FINAL_DIR,
@@ -2073,8 +2116,10 @@ def run_realtime_pipeline(
 # ------------------------------
 
 def load_checkpoint(output_dir: str) -> Dict[str, Any]:
-    """Load checkpoint data from file."""
-    checkpoint_file = os.path.join(output_dir, "checkpoint.json")
+    """Load checkpoint data from centralized, category-scoped file.
+    Note: output_dir is ignored; retained for signature compatibility.
+    """
+    checkpoint_file = get_outputs_checkpoint_path()
     if os.path.exists(checkpoint_file):
         try:
             with open(checkpoint_file, "r", encoding="utf-8") as f:
@@ -2113,8 +2158,10 @@ def load_checkpoint(output_dir: str) -> Dict[str, Any]:
 
 
 def save_checkpoint(output_dir: str, checkpoint_data: Dict[str, Any]) -> None:
-    """Save checkpoint data to file."""
-    checkpoint_file = os.path.join(output_dir, "checkpoint.json")
+    """Save checkpoint data to centralized, category-scoped file.
+    Note: output_dir is ignored; retained for signature compatibility.
+    """
+    checkpoint_file = get_outputs_checkpoint_path()
     
     # Convert set to list for JSON serialization
     checkpoint_copy = checkpoint_data.copy()
@@ -2159,11 +2206,28 @@ def update_checkpoint(output_dir: str, product_row: Dict[str, str], success: boo
             checkpoint_data.setdefault("failed_skus", set()).add(product_row['sku'])
             checkpoint_data.setdefault("completed_skus", set()).discard(product_row['sku'])
     
-    checkpoint_data["total_processed"] += 1
-    if success:
-        checkpoint_data["successful"] += 1
+    # Recompute counters from current state so metrics reflect the latest truth
+    # Prefer SKU-based counts when available; fall back to product lists otherwise
+    completed_skus = checkpoint_data.get("completed_skus", set())
+    failed_skus = checkpoint_data.get("failed_skus", set())
+    completed_products = checkpoint_data.get("completed_products", [])
+    failed_products = checkpoint_data.get("failed_products", [])
+
+    # Safety: ensure no duplicates across lists (product-level)
+    if failed_products:
+        # remove any product_ids from failed that are now in completed
+        checkpoint_data["failed_products"] = [pid for pid in failed_products if pid not in set(completed_products)]
+
+    # Compute counts
+    if isinstance(completed_skus, set) and isinstance(failed_skus, set) and (len(completed_skus) + len(failed_skus)) > 0:
+        checkpoint_data["successful"] = len(completed_skus)
+        checkpoint_data["failed"] = len(failed_skus)
+        checkpoint_data["total_processed"] = checkpoint_data["successful"] + checkpoint_data["failed"]
     else:
-        checkpoint_data["failed"] += 1
+        # Fallback to product-level identifiers
+        checkpoint_data["successful"] = len(set(completed_products))
+        checkpoint_data["failed"] = len(set(checkpoint_data.get("failed_products", [])))
+        checkpoint_data["total_processed"] = checkpoint_data["successful"] + checkpoint_data["failed"]
     
     save_checkpoint(output_dir, checkpoint_data)
 
@@ -2182,13 +2246,26 @@ def is_product_completed(product_row: Dict[str, str], checkpoint_data: Dict[str,
     return product_id in checkpoint_data.get("completed_products", [])
 
 
+def is_product_failed(product_row: Dict[str, str], checkpoint_data: Dict[str, Any]) -> bool:
+    """Check if product is currently marked as failed in the outputs checkpoint."""
+    # Check by SKU first
+    if product_row.get('sku') and product_row['sku'] in checkpoint_data.get("failed_skus", set()):
+        return True
+    # Check by product identifier
+    product_id = f"{product_row.get('brand','')}_{product_row.get('product_name','')}_{product_row.get('shade_of_lipstick','')}"
+    if product_row.get('sku'):
+        product_id += f"_{product_row['sku']}"
+    return product_id in checkpoint_data.get("failed_products", [])
+
 # ------------------------------
 # Batch Tracking System (for 15-min cutoff + resume)
 # ------------------------------
 
 def load_batch_tracker(output_dir: str) -> Dict[str, Any]:
-    """Load batch tracker data from file."""
-    tracker_file = os.path.join(output_dir, "batch_tracker.json")
+    """Load batch tracker data from centralized, category-scoped file.
+    Note: output_dir is ignored; kept for backward-compatible signature.
+    """
+    tracker_file = get_batch_tracker_path()
     if os.path.exists(tracker_file):
         try:
             with open(tracker_file, "r", encoding="utf-8") as f:
@@ -2204,8 +2281,10 @@ def load_batch_tracker(output_dir: str) -> Dict[str, Any]:
 
 
 def save_batch_tracker(output_dir: str, tracker_data: Dict[str, Any]) -> None:
-    """Save batch tracker data to file."""
-    tracker_file = os.path.join(output_dir, "batch_tracker.json")
+    """Save batch tracker data to centralized, category-scoped file.
+    Note: output_dir is ignored; kept for backward-compatible signature.
+    """
+    tracker_file = get_batch_tracker_path()
     tracker_data["last_updated"] = datetime.now().isoformat()
     
     try:
@@ -2732,22 +2811,40 @@ def resume_pending_batches(
 def build_user_message(product_row: Dict[str, str], use_natural_generation: bool = True) -> Tuple[str, str]:
     # Map CSV fields to the schema keys commonly used in your lipstick template
     # Validate required fields before constructing the payload
-    required_keys = ["brand", "product_name", "shade_of_lipstick", "s_no"]
-    missing = [k for k in required_keys if not (product_row.get(k) or "").strip()]
+    # Shade can be absent for some categories (e.g., lip balms/treatments). s_no may be missing
+    # depending on the input source. Only enforce absolutely essential keys.
+    required_keys = ["brand", "product_name"]
+    missing = [k for k in required_keys if not (str(product_row.get(k) or "").strip())]
     if missing:
         raise ValueError(f"Missing required fields for user message: {', '.join(missing)}")
 
+    # Resolve shade using flexible keys and allow empty
+    shade_val = (
+        product_row.get("shade_of_lipstick")
+        or product_row.get("shade")
+        or product_row.get("color")
+        or ""
+    )
+
     product_for_model = {
-        "brand": product_row["brand"],
-        "product_line": product_row["product_name"],  # maps to template's product_line
-        "shade": product_row["shade_of_lipstick"],
-        "full_name": product_row["full_name"],
-        "sku": product_row.get("sku", ""),
-        "category": product_row.get("category", ""),
-        "sub_category": product_row.get("sub_category", ""),
-        "leaf_level_category": product_row.get("leaf_level_category", ""),
-        "s_no": product_row.get("s_no", ""),
+        "brand": product_row.get("brand", ""),
+        "product_line": product_row.get("product_name", ""),  # maps to template's product_line
+        "shade": shade_val,
+        "full_name": product_row.get("full_name", ""),
+        "sku": product_row.get("sku") or product_row.get("Kult SKU Code") or "",
+        "category": product_row.get("category") or product_row.get("Category") or "",
+        "sub_category": product_row.get("sub_category") or product_row.get("Sub Category") or "",
+        "leaf_level_category": product_row.get("leaf_level_category") or product_row.get("Sub sub category") or "",
+        "s_no": product_row.get("s_no") or product_row.get("S.No.") or "",
     }
+    # Log the payload we will send to the model for traceability
+    try:
+        logging.getLogger(__name__).info(
+            "[build_user_message] product_for_model=%s",
+            json.dumps(product_for_model, ensure_ascii=False)
+        )
+    except Exception:
+        pass
 
     if use_natural_generation:
         # Dynamic per-product message (non-cacheable). System is supplied elsewhere for batching.
@@ -2756,6 +2853,17 @@ def build_user_message(product_row: Dict[str, str], use_natural_generation: bool
         
         if gpt_context:
             # Claude stage: include GPT context
+            try:
+                _sku = product_row.get('sku') or product_row.get('Kult SKU Code') or 'N/A'
+                _brand = product_row.get('brand') or product_row.get('Brand') or 'N/A'
+                _pname = product_row.get('product_name') or product_row.get('Product_name') or 'N/A'
+                _shade = product_row.get('shade_of_lipstick') or product_row.get('Shade') or 'N/A'
+                logging.getLogger(__name__).info(
+                    "[build_user_message] Using gpt_context (len=%d) (SKU=%s, brand=%s, product=%s, shade=%s)",
+                    len(gpt_context or ""), _sku, _brand, _pname, _shade
+                )
+            except Exception:
+                pass
             user_text = textwrap.dedent(
                 f"""
                 Product Information:
@@ -2766,6 +2874,18 @@ def build_user_message(product_row: Dict[str, str], use_natural_generation: bool
                 """
             ).strip()
         else:
+            # Log missing GPT context for visibility during Claude runs
+            try:
+                _sku = product_row.get('sku') or product_row.get('Kult SKU Code') or 'N/A'
+                _brand = product_row.get('brand') or product_row.get('Brand') or 'N/A'
+                _pname = product_row.get('product_name') or product_row.get('Product_name') or 'N/A'
+                _shade = product_row.get('shade_of_lipstick') or product_row.get('Shade') or 'N/A'
+                logging.getLogger(__name__).warning(
+                    "[build_user_message] Missing gpt_context; proceeding without context (SKU=%s, brand=%s, product=%s, shade=%s)",
+                    _sku, _brand, _pname, _shade
+                )
+            except Exception:
+                pass
             # GPT stage: product info only
             user_text = textwrap.dedent(
                 f"""
@@ -3133,7 +3253,7 @@ def main() -> None:
         pass
     # Hardcoded prompt paths (separate for GPT and Claude)
     gpt_prompt_path = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/data/gpt_prompt.json"
-    claude_prompt_path = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/data/beauty_prompt_restored(1).json"
+    claude_prompt_path = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/data/lip_treatment_complete_prompt_v7.json"
     
     # Data source selection based on USE_EXCEL_DATA parameter
     if USE_EXCEL_DATA:
@@ -3146,7 +3266,7 @@ def main() -> None:
         logger = logging.getLogger(__name__)
         logger.info("Using CSV data source (local): %s", input_data_path)
     
-    output_dir = "/home/sid/Documents/Automation_QnA_Attribute/QnA_Generation/output"
+    output_dir = CLAUDE_FINAL_DIR
     model = DEFAULT_MODEL
     max_tokens = 32000
 
@@ -3159,8 +3279,7 @@ def main() -> None:
     except Exception as _:
         logger.warning("Failed to load .env; relying on process environment variables")
     
-    # Load checkpoint data
-    checkpoint_data = load_checkpoint(output_dir)
+    # Load checkpoint data (moved below after setting stage)
     
     # Start timing
     start_time = time.time()
@@ -3168,19 +3287,7 @@ def main() -> None:
     logger.info("QnA Generation Script Started")
     logger.info(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 60)
-    
-    # Log checkpoint status
-    if checkpoint_data["total_processed"] > 0:
-        logger.info("📋 CHECKPOINT STATUS:")
-        logger.info(f"   Previously processed: {checkpoint_data['total_processed']} products")
-        logger.info(f"   Previously successful: {checkpoint_data['successful']}")
-        logger.info(f"   Previously failed: {checkpoint_data['failed']}")
-        logger.info(f"   Last updated: {checkpoint_data.get('last_updated', 'Unknown')}")
-        logger.info(f"   Completed SKUs: {len(checkpoint_data['completed_skus'])}")
-        logger.info(f"   Failed SKUs: {len(checkpoint_data['failed_skus'])}")
-        logger.info("   Resuming from checkpoint...")
-    else:
-        logger.info("📋 Starting fresh - no previous checkpoint found")
+
 
     # Select provider and validate API keys
     provider = None
@@ -3194,6 +3301,19 @@ def main() -> None:
     else:
         logger.error("No provider enabled. Set USE_GPT=True or USE_CLAUDE=True.")
         sys.exit(2)
+
+    # Set stage for outputs checkpointing based on flags/provider
+    try:
+        global CURRENT_CHECKPOINT_STAGE
+        if getattr(args, "gpt_only", False) and not getattr(args, "claude_only", False):
+            CURRENT_CHECKPOINT_STAGE = "gpt"
+        elif provider == "gpt":
+            CURRENT_CHECKPOINT_STAGE = "gpt"
+        else:
+            CURRENT_CHECKPOINT_STAGE = "claude"
+        logger.info("Outputs checkpoint stage set to: %s", CURRENT_CHECKPOINT_STAGE)
+    except Exception:
+        pass
 
     anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
     openai_api_key = os.getenv("OPENAI_API_KEY")
@@ -3209,6 +3329,26 @@ def main() -> None:
     
     os.makedirs(output_dir, exist_ok=True)
     logger.info(f"Output directory: {output_dir}")
+    # Load outputs checkpoint only for non-GPT-only runs (Claude or pipeline paths)
+    if not args.gpt_only:
+        checkpoint_data = load_checkpoint(output_dir)
+        # Log checkpoint status (now that checkpoint_data is available)
+        if checkpoint_data.get("total_processed", 0) > 0:
+            logger.info("📋 CHECKPOINT STATUS:")
+            logger.info(f"   Previously processed: {checkpoint_data['total_processed']} products")
+            logger.info(f"   Previously successful: {checkpoint_data['successful']}")
+            logger.info(f"   Previously failed: {checkpoint_data['failed']}")
+            logger.info(f"   Last updated: {checkpoint_data.get('last_updated', 'Unknown')}")
+            try:
+                logger.info(f"   Completed SKUs: {len(checkpoint_data.get('completed_skus', []))}")
+                logger.info(f"   Failed SKUs: {len(checkpoint_data.get('failed_skus', []))}")
+            except Exception:
+                pass
+            logger.info("   Resuming from checkpoint...")
+        else:
+            logger.info("📋 Starting fresh - no previous checkpoint found")
+    else:
+        checkpoint_data = {}
     # Determine caching behavior
     use_prompt_cache = not args.no_cache
     logger.info("Prompt caching: %s", "ENABLED" if use_prompt_cache else "DISABLED")
@@ -3241,7 +3381,7 @@ def main() -> None:
             model=model,
             prompt_text=claude_prompt_text,
             max_tokens=max_tokens,
-            output_dir=output_dir,
+            output_dir=CLAUDE_FINAL_DIR,
             logger=logger,
             no_ingest=args.no_ingest,
             use_cache=use_prompt_cache,
@@ -3261,7 +3401,7 @@ def main() -> None:
         logger.info(f"   Success rate: {(ok/(ok+fail)*100):.1f}%" if (ok+fail) > 0 else "N/A")
         logger.info("")
         logger.info(f"💰 Token usage: {in_tok:,} input + {out_tok:,} output = {in_tok + out_tok:,}")
-        logger.info(f"📁 Output directory: {output_dir}")
+        logger.info(f"📁 Output directory: {CLAUDE_FINAL_DIR}")
         logger.info("="*60)
         sys.exit(0)
 
@@ -3273,8 +3413,13 @@ def main() -> None:
         logger.info(f"Loaded GPT prompt from: {gpt_prompt_path}")
         claude_prompt = read_prompt(claude_prompt_path)
         logger.info(f"Loaded Claude prompt from: {claude_prompt_path}")
-        # Backward compatibility variable for code paths that still reference 'prompt_text' for GPT
-        prompt_text = gpt_prompt
+        # Backward compatibility: single variable used by downstream code paths
+        # Use Claude prompt when provider is 'claude', else use GPT prompt
+        prompt_text = claude_prompt if provider == "claude" else gpt_prompt
+        try:
+            logger.info("Active provider=%s -> using %s prompt for system blocks", provider, "CLAUDE" if provider == "claude" else "GPT")
+        except Exception:
+            pass
         
         # Always use inline shape-only REQUIRED JSON FORMAT; no external schema file
         
@@ -3284,35 +3429,44 @@ def main() -> None:
         logger.error(f"Failed to load configuration files: {e}")
         sys.exit(1)
 
-    # Filter out already completed products (check both checkpoint and file existence)
-    remaining_rows = []
-    skipped_checkpoint = 0
-    skipped_existing_files = 0
-    
-    for row in rows:
-        # Check checkpoint first
-        if is_product_completed(row, checkpoint_data):
-            skipped_checkpoint += 1
-            logger.debug(f"Skipping already completed: {row['brand']} {row['product_name']} - {row['shade_of_lipstick']} (SKU: {row.get('sku', 'N/A')})")
-            continue
+    # Filter out already completed products (only relevant for Claude/final outputs runs)
+    if not args.gpt_only:
+        remaining_rows = []
+        skipped_checkpoint = 0
+        skipped_existing_files = 0
         
-        # Also check if output file already exists (even if marked as failed in checkpoint)
-        filename = create_output_filename(row)
-        filepath = os.path.join(output_dir, filename)
-        if os.path.exists(filepath):
-            skipped_existing_files += 1
-            logger.debug(f"Skipping existing file: {filename}")
-            continue
+        for row in rows:
+            # Check checkpoint first
+            if is_product_completed(row, checkpoint_data):
+                skipped_checkpoint += 1
+                _shade_dbg = row.get('shade_of_lipstick') or row.get('shade') or row.get('color') or 'N/A'
+                logger.debug(f"Skipping already completed: {row.get('brand','')} {row.get('product_name','')} - {_shade_dbg} (SKU: {row.get('sku', 'N/A')})")
+                continue
+            
+            # Also check if output file already exists (even if marked as failed in checkpoint)
+            filename = create_output_filename(row)
+            filepath = os.path.join(output_dir, filename)
+            if os.path.exists(filepath):
+                if is_product_failed(row, checkpoint_data):
+                    # Keep it for processing so ingestion can be (re)attempted
+                    logger.debug(f"Existing file present but marked failed in checkpoint; scheduling ingestion retry: {filename}")
+                else:
+                    skipped_existing_files += 1
+                    logger.debug(f"Skipping existing file: {filename}")
+                    continue
+            
+            # Neither completed in checkpoint nor file exists -> needs processing
+            remaining_rows.append(row)
         
-        # Neither completed in checkpoint nor file exists -> needs processing
-        remaining_rows.append(row)
-    
-    if skipped_checkpoint > 0:
-        logger.info(f"🔄 Skipped {skipped_checkpoint} already completed products from checkpoint")
-    if skipped_existing_files > 0:
-        logger.info(f"📁 Skipped {skipped_existing_files} products with existing output files")
-    
-    logger.info(f"📊 Products to process: {len(remaining_rows)} (out of {len(rows)} total)")
+        if skipped_checkpoint > 0:
+            logger.info(f"🔄 Skipped {skipped_checkpoint} already completed products from checkpoint")
+        if skipped_existing_files > 0:
+            logger.info(f"📁 Skipped {skipped_existing_files} products with existing output files")
+        
+        logger.info(f"📊 Products to process: {len(remaining_rows)} (out of {len(rows)} total)")
+    else:
+        # In GPT-only mode, we process GPT contexts for all rows; filtering is handled by GPT checkpoint inside run_gpt_stage
+        remaining_rows = rows
 
     # Processing statistics for this session
     session_ok, session_fail = 0, 0
@@ -3388,7 +3542,7 @@ def main() -> None:
             
             claude_ok, claude_fail, in_tok, out_tok = run_claude_scheduler(
                 all_rows=rows,
-                prompt_text=claude_prompt,
+                claude_prompt=claude_prompt,
                 anthropic_api_key=anthropic_api_key,
                 claude_model=claude_model,
                 logger=logger,
@@ -3480,7 +3634,7 @@ def main() -> None:
                 logger.info("="*60)
                 claude_ok, claude_fail, in_tok, out_tok = run_claude_scheduler(
                     all_rows=rows,
-                    prompt_text=claude_prompt,
+                    claude_prompt=claude_prompt,
                     anthropic_api_key=anthropic_api_key,
                     claude_model=claude_model,
                     logger=logger,
@@ -3528,7 +3682,7 @@ def main() -> None:
             prompt_text=prompt_text,
             max_tokens=max_tokens,
             batch_size=batch_size,
-            output_dir=output_dir,
+            output_dir=CLAUDE_FINAL_DIR,
             logger=logger,
             no_ingest=args.no_ingest,
             use_cache=use_prompt_cache,
@@ -3579,7 +3733,8 @@ def main() -> None:
 
     for idx, row in enumerate(remaining_rows, 1):
         product_start_time = time.time()
-        product_info = f"{row['brand']} {row['product_name']} - {row['shade_of_lipstick']}"
+        _shade = row.get('shade_of_lipstick') or row.get('shade') or row.get('color') or ''
+        product_info = f"{row.get('brand','')} {row.get('product_name','')}" + (f" - {_shade}" if _shade else "")
         if row.get('sku'):
             product_info += f" (SKU: {row['sku']})"
             
@@ -3814,18 +3969,20 @@ def main() -> None:
 
     # Final statistics
     total_time = time.time() - start_time
-    
-    # Update session stats in checkpoint
-    session_stats = {
-        "timestamp": datetime.now().isoformat(),
-        "processed": session_ok + session_fail,
-        "successful": session_ok,
-        "failed": session_fail,
-        "duration_seconds": total_time,
-        "tokens_used": total_input_tokens + total_output_tokens
-    }
-    checkpoint_data["session_stats"].append(session_stats)
-    save_checkpoint(output_dir, checkpoint_data)
+
+    # Update and log based on mode
+    if not args.gpt_only:
+        # Update session stats in outputs checkpoint
+        session_stats = {
+            "timestamp": datetime.now().isoformat(),
+            "processed": session_ok + session_fail,
+            "successful": session_ok,
+            "failed": session_fail,
+            "duration_seconds": total_time,
+            "tokens_used": total_input_tokens + total_output_tokens
+        }
+        checkpoint_data["session_stats"].append(session_stats)
+        save_checkpoint(output_dir, checkpoint_data)
     
     logger.info("=" * 60)
     logger.info("QnA Generation Session Completed")
@@ -3837,19 +3994,37 @@ def main() -> None:
     logger.info(f"   Successful this session: {session_ok}")
     logger.info(f"   Failed this session: {session_fail}")
     logger.info(f"   Skipped (file exists): {len(skipped_files)}")
-    logger.info(f"   Skipped (checkpoint): {skipped_checkpoint}")
+    if not args.gpt_only:
+        logger.info(f"   Skipped (checkpoint): {skipped_checkpoint}")
     logger.info("")
-    logger.info("📈 OVERALL STATISTICS:")
-    logger.info(f"   Total products in CSV: {len(rows)}")
-    logger.info(f"   Total completed: {checkpoint_data['successful']}")
-    logger.info(f"   Total failed: {checkpoint_data['failed']}")
-    logger.info(f"   Overall success rate: {(checkpoint_data['successful']/(checkpoint_data['successful']+checkpoint_data['failed'])*100):.1f}%" if (checkpoint_data['successful']+checkpoint_data['failed']) > 0 else "N/A")
-    logger.info(f"   Completion rate: {(checkpoint_data['successful']/len(rows)*100):.1f}%")
-    logger.info("")
-    logger.info(f"💰 Token usage this session: {total_input_tokens:,} input + {total_output_tokens:,} output = {total_input_tokens + total_output_tokens:,}")
-    logger.info(f"⏱️  Average time per product: {total_time/max(session_ok+session_fail, 1):.2f} seconds")
-    logger.info(f"📁 Output directory: {output_dir}")
-    logger.info(f"📋 Checkpoint file: {os.path.join(output_dir, 'checkpoint.json')}")
+    
+    # Overall statistics and locations
+    if not args.gpt_only:
+        logger.info("📈 OVERALL STATISTICS:")
+        logger.info(f"   Total products in CSV: {len(rows)}")
+        logger.info(f"   Total completed: {checkpoint_data['successful']}")
+        logger.info(f"   Total failed: {checkpoint_data['failed']}")
+        logger.info(f"   Overall success rate: {(checkpoint_data['successful']/(checkpoint_data['successful']+checkpoint_data['failed'])*100):.1f}%" if (checkpoint_data['successful']+checkpoint_data['failed']) > 0 else "N/A")
+        logger.info(f"   Completion rate: {(checkpoint_data['successful']/len(rows)*100):.1f}%")
+        logger.info("")
+        logger.info(f"💰 Token usage this session: {total_input_tokens:,} input + {total_output_tokens:,} output = {total_input_tokens + total_output_tokens:,}")
+        logger.info(f"⏱️  Average time per product: {total_time/max(session_ok+session_fail, 1):.2f} seconds")
+        # Output directory here refers to Claude final outputs (or chosen outputs dir)
+        logger.info(f"📁 Output directory: {output_dir}")
+        # Show actual outputs checkpoint path
+        try:
+            logger.info(f"📋 Checkpoint file: {get_outputs_checkpoint_path()}")
+        except Exception:
+            pass
+    else:
+        # GPT-only summary
+        logger.info(f"💰 Token usage this session: {total_input_tokens:,} input + {total_output_tokens:,} output = {total_input_tokens + total_output_tokens:,}")
+        logger.info(f"⏱️  Average time per product: {total_time/max(session_ok+session_fail, 1):.2f} seconds")
+        logger.info(f"📁 Output directory (GPT contexts): {GPT_CONTEXTS_DIR}")
+        try:
+            logger.info(f"📋 Checkpoint file (GPT stage): {get_gpt_checkpoint_path()}")
+        except Exception:
+            pass
     logger.info("=" * 60)
 
 
